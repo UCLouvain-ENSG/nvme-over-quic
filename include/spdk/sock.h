@@ -422,6 +422,33 @@ const char *spdk_sock_get_interface_name(struct spdk_sock *sock);
 int32_t spdk_sock_get_numa_id(struct spdk_sock *sock);
 
 /**
+ * Get the remote address for a UDP socket.
+ *
+ * For unconnected UDP sockets, returns the source address of the most recently received datagram.
+ * This is useful for connection migration detection in QUIC.
+ *
+ * \param sock UDP socket to get the remote address from.
+ * \param addr Buffer to store the remote address.
+ * \param addrlen Pointer to size of addr buffer, updated with actual address size.
+ *
+ * \return 0 on success, -1 if not a UDP socket or no remote address available.
+ */
+int spdk_sock_get_remote_addr(struct spdk_sock *sock, struct sockaddr_storage *addr, socklen_t *addrlen);
+
+/**
+ * Get the local address for a socket.
+ *
+ * Returns the local address to which the socket is bound.
+ *
+ * \param sock Socket to get the local address from.
+ * \param addr Buffer to store the local address.
+ * \param addrlen Pointer to size of addr buffer, updated with actual address size.
+ *
+ * \return 0 on success, -1 on failure.
+ */
+int spdk_sock_get_local_addr(struct spdk_sock *sock, struct sockaddr_storage *addr, socklen_t *addrlen);
+
+/**
  * Close a socket.
  *
  * Returning -1 and setting errno is deprecated and will be changed in the 26.01 release.
@@ -487,6 +514,19 @@ ssize_t spdk_sock_writev(struct spdk_sock *sock, struct iovec *iov, int iovcnt);
  * \param req The write request to submit.
  */
 void spdk_sock_writev_async(struct spdk_sock *sock, struct spdk_sock_request *req);
+
+
+
+/* for UDP */
+int spdk_sock_writev_direct(struct spdk_sock *sock, struct iovec *iov, int iovcnt,
+			  struct sockaddr *addr, socklen_t addrlen);
+
+
+/* for UDP */
+size_t spdk_sock_recv_with_msghdr(struct spdk_sock *sock, void *buf, size_t len,
+				struct msghdr *msg);
+
+
 
 /**
  * Read message from the given socket to the I/O vector array.
@@ -677,8 +717,8 @@ int spdk_sock_group_provide_buf(struct spdk_sock_group *group, void *buf, size_t
  *
  * \return the number of events on success, -1 on failure.
  */
-int spdk_sock_group_poll(struct spdk_sock_group *group);
 
+int spdk_sock_group_poll(struct spdk_sock_group *group);
 /**
  * Poll incoming events up to max_events for each registered socket.
  *

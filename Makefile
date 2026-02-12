@@ -20,6 +20,7 @@ DIRS-y += test
 DIRS-$(CONFIG_IPSEC_MB) += ipsecbuild
 DIRS-$(CONFIG_ISAL) += isalbuild
 DIRS-$(CONFIG_ISAL_CRYPTO) += isalcryptobuild
+DIRS-$(CONFIG_QUIC) += quiclybuild
 DIRS-$(CONFIG_VFIO_USER) += vfiouserbuild
 DIRS-$(CONFIG_SMA) += proto
 DIRS-$(CONFIG_XNVME) += xnvmebuild
@@ -77,6 +78,11 @@ VFIOUSERBUILD = vfiouserbuild
 LIB += vfiouserbuild
 endif
 
+ifeq ($(CONFIG_QUIC),y)
+QUICLYBUILD = quiclybuild
+LIB += quiclybuild
+endif
+
 ifeq ($(CONFIG_XNVME),y)
 XNVMEBUILD = xnvmebuild
 LIB += xnvmebuild
@@ -99,7 +105,7 @@ dpdkdeps $(DPDK_DEPS): $(WPDK)
 dpdkbuild: $(WPDK) $(DPDK_DEPS)
 endif
 
-lib: $(WPDK) $(DPDKBUILD) $(VFIOUSERBUILD) $(XNVMEBUILD) $(ISALBUILD) $(ISALCRYPTOBUILD)
+lib: $(WPDK) $(DPDKBUILD) $(VFIOUSERBUILD) $(QUICLYBUILD) $(XNVMEBUILD) $(ISALBUILD) $(ISALCRYPTOBUILD)
 module: lib
 shared_lib: module
 app: $(LIB)

@@ -2697,13 +2697,14 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 			perf_set_sock_opts("ssl", "tls_version", val, NULL);
 			break;
 		case PERF_PSK_PATH:
-			ssl_used = true;
 			free_key(&g_psk);
 			g_psk = alloc_key("perf-psk", optarg);
 			if (g_psk == NULL) {
 				fprintf(stderr, "Unable to set PSK at %s\n", optarg);
 				return 1;
 			}
+			/* PSK is used by both TCP/SSL and QUIC transports */
+			ssl_used = true;
 			break;
 		case PERF_PSK_IDENTITY:
 			ssl_used = true;
@@ -2818,9 +2819,20 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 	}
 
 	if (ssl_used && strncmp(sock_impl, "ssl", 3) != 0) {
-		fprintf(stderr, "sock impl is not SSL but tried to use one of the SSL only options\n");
-		usage(argv[0]);
-		return 1;
+		/* Allow PSK for QUIC transport (which has built-in TLS) */
+		bool is_quic = false;
+		struct _trid_entry *trid_entry;
+		TAILQ_FOREACH(trid_entry, &g_trid_list, tailq) {
+			if (trid_entry->entry.trid.trtype == SPDK_NVME_TRANSPORT_QUIC) {
+				is_quic = true;
+				break;
+			}
+		}
+		if (!is_quic) {
+			fprintf(stderr, "sock impl is not SSL but tried to use one of the SSL only options\n");
+			usage(argv[0]);
+			return 1;
+		}
 	}
 
 

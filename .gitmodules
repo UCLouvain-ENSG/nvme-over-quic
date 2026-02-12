@@ -19,3 +19,6 @@
 [submodule "isa-l-crypto"]
 	path = isa-l-crypto
 	url = https://github.com/intel/isa-l_crypto
+[submodule "quicly"]
+	path = quicly
+	url = https://github.com/h2o/quicly.git

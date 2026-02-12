@@ -840,6 +840,9 @@ nvmf_qpair_access_allowed(struct spdk_nvmf_qpair *qpair, struct spdk_nvmf_subsys
 		return false;
 	}
 
+	SPDK_ERRLOG("Access check: listen_trid trtype=%d, adrfam=%d, traddr='%s', trsvcid='%s'\n",
+		    listen_trid.trtype, listen_trid.adrfam, listen_trid.traddr, listen_trid.trsvcid);
+
 	if (!spdk_nvmf_subsystem_listener_allowed(subsystem, &listen_trid)) {
 		SPDK_ERRLOG("Subsystem '%s' does not allow host '%s' to connect at this address.\n",
 			    subsystem->subnqn, hostnqn);
@@ -1019,6 +1022,11 @@ nvmf_ctrlr_cmd_connect(struct spdk_nvmf_request *req)
 	struct spdk_nvmf_fabric_connect_rsp *rsp = &req->rsp->connect_rsp;
 	struct spdk_nvmf_transport *transport = req->qpair->transport;
 	struct spdk_nvmf_subsystem *subsystem;
+
+	SPDK_DEBUGLOG(nvmf, "CONNECT received: req->length=%u, req->iovcnt=%d, iov_base=%p, iov_len=%zu\n",
+		    req->length, req->iovcnt, req->iov[0].iov_base, req->iov[0].iov_len);
+	SPDK_DEBUGLOG(nvmf, "CONNECT data: cntlid=0x%x, hostnqn='%s', subnqn='%s'\n",
+		    data->cntlid, data->hostnqn, data->subnqn);
 
 	if (req->length < sizeof(struct spdk_nvmf_fabric_connect_data)) {
 		SPDK_ERRLOG("Connect command data length 0x%x too small\n", req->length);

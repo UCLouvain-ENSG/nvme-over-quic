@@ -15,6 +15,7 @@ C_SRCS = ctrlr.c ctrlr_discovery.c ctrlr_bdev.c \
 
 C_SRCS-$(CONFIG_RDMA) += rdma.c
 C_SRCS-$(CONFIG_HAVE_EVP_MAC) += auth.c
+C_SRCS-$(CONFIG_QUIC) += quic.c
 
 LIBNAME = nvmf
 LOCAL_SYS_LIBS =

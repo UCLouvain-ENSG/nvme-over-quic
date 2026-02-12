@@ -387,6 +387,24 @@ spdk_sock_posix_getaddrinfo(const char *ip, int port)
 	return res;
 }
 
+
+int
+spdk_sock_writev_direct(struct spdk_sock *sock,
+			    struct iovec *iovs, int iovcnt,
+			    struct sockaddr *addr, socklen_t addrlen)
+{
+	return sock->net_impl->writev_direct(sock, iovs, iovcnt, addr, addrlen);
+}
+
+size_t
+spdk_sock_recv_with_msghdr(struct spdk_sock *sock,
+			    void *buf, size_t len,
+			    struct msghdr *msg)
+{
+	return sock->net_impl->recv_with_msghdr(sock, buf, len, msg);
+}
+
+
 int
 spdk_sock_posix_fd_create(struct addrinfo *res, struct spdk_sock_opts *opts,
 			  struct spdk_sock_impl_opts *impl_opts)
@@ -1295,6 +1313,7 @@ spdk_sock_get_default_impl(void)
 	return NULL;
 }
 
+
 int
 spdk_sock_group_register_interrupt(struct spdk_sock_group *group, uint32_t events,
 				   spdk_interrupt_fn fn,
@@ -1361,4 +1380,11 @@ sock_trace(void)
 	spdk_trace_register_object(OBJECT_SOCK_REQ, 's');
 	spdk_trace_register_description_ext(opts, SPDK_COUNTOF(opts));
 }
+
+
+// static void
+// spdk_sock_udp_recv(struct spdk_sock *sock, )
+
+
+
 SPDK_TRACE_REGISTER_FN(sock_trace, "sock", TRACE_GROUP_SOCK)

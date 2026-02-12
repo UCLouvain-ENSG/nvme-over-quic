@@ -1611,6 +1611,8 @@ nvme_complete_request(spdk_nvme_cmd_cb cb_fn, void *cb_arg, struct spdk_nvme_qpa
 	 * function instead using the qpair that was passed by the caller, instead
 	 * of getting it from the req.
 	 */
+	// SPDK_ERRLOG("Call the request Free: cpl: %02x/%02x, req: opc=%02x, cid=%d\n",
+	// 	    cpl->status.sct, cpl->status.sc, req->cmd.opc, req->cmd.cid);
 	_nvme_free_request(req, qpair);
 
 	if (spdk_likely(cb_fn)) {

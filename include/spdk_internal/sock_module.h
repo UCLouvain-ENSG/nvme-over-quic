@@ -120,6 +120,11 @@ struct spdk_net_impl {
 	int (*get_opts)(struct spdk_sock_impl_opts *opts, size_t *len);
 	int (*set_opts)(const struct spdk_sock_impl_opts *opts, size_t len);
 
+	int (*writev_direct)(struct spdk_sock *sock, struct iovec *iov, int iovcnt, struct sockaddr *addr, socklen_t addrlen);
+
+	ssize_t (*recv_with_msghdr)(struct spdk_sock *sock, void *buf, size_t len,
+				    struct msghdr *msg);
+					
 	STAILQ_ENTRY(spdk_net_impl) link;
 };
 

@@ -164,6 +164,9 @@ spdk_nvme_build_name(char *name, size_t length, struct spdk_nvme_ctrlr *ctrlr,
 	case SPDK_NVME_TRANSPORT_TCP:
 		res = snprintf(name, length, "TCP (addr:%s subnqn:%s)", trid->traddr, trid->subnqn);
 		break;
+	case SPDK_NVME_TRANSPORT_QUIC:
+		res = snprintf(name, length, "QUIC (addr:%s subnqn:%s)", trid->traddr, trid->subnqn);
+		break;
 	case SPDK_NVME_TRANSPORT_VFIOUSER:
 		res = snprintf(name, length, "VFIOUSER (%s)", trid->traddr);
 		break;

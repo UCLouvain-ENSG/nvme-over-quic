@@ -2462,12 +2462,17 @@ nvme_ctrlr_identify_active_ns_async_done(void *arg, const struct spdk_nvme_cpl *
 
 	memcpy(&ctx->status.cpl, cpl, sizeof(*cpl));
 	if (spdk_nvme_cpl_is_error(cpl)) {
+		NVME_CTRLR_ERRLOG(ctx->ctrlr, "IDENTIFY Active NS List failed: sc=0x%x sct=0x%x\n",
+				  cpl->status.sc, cpl->status.sct);
 		ctx->state = NVME_ACTIVE_NS_STATE_ERROR;
 		goto out;
 	}
 
 	ctx->next_nsid = ctx->new_ns_list[1024 * ctx->page_count - 1];
+	// NVME_CTRLR_ERRLOG(ctx->ctrlr, "IDENTIFY Active NS List page %u: next_nsid=%u, first NS=%u\n",
+	// 		    ctx->page_count, ctx->next_nsid, ctx->new_ns_list[0]);
 	if (ctx->next_nsid == 0) {
+		// NVME_CTRLR_ERRLOG(ctx->ctrlr, "IDENTIFY Active NS List complete: %u pages\n", ctx->page_count);
 		ctx->state = NVME_ACTIVE_NS_STATE_DONE;
 		goto out;
 	}
@@ -2502,7 +2507,11 @@ nvme_ctrlr_identify_active_ns_async(struct nvme_active_ns_ctx *ctx)
 	uint32_t i;
 	int rc;
 
+	NVME_CTRLR_DEBUGLOG(ctrlr, "IDENTIFY Active NS List: starting, ctrlr->cdata.nn=%u, next_nsid=%u\n",
+			    ctrlr->cdata.nn, ctx->next_nsid);
+
 	if (ctrlr->cdata.nn == 0) {
+		NVME_CTRLR_ERRLOG(ctrlr, "Controller reports 0 namespaces (cdata.nn=0)\n");
 		ctx->state = NVME_ACTIVE_NS_STATE_DONE;
 		goto out;
 	}

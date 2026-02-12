@@ -297,7 +297,7 @@ nvme_tcp_req_put(struct nvme_tcp_qpair *tqpair, struct nvme_tcp_req *tcp_req)
 {
 	assert(tcp_req->state != NVME_TCP_REQ_FREE);
 	tcp_req->state = NVME_TCP_REQ_FREE;
-	TAILQ_INSERT_HEAD(&tqpair->free_reqs, tcp_req, link);
+	TAILQ_INSERT_TAIL(&tqpair->free_reqs, tcp_req, link);
 }
 
 static inline void
@@ -2903,7 +2903,10 @@ nvme_tcp_poll_group_process_completions(struct spdk_nvme_transport_poll_group *t
 	group->num_completions = 0;
 	group->stats.polls++;
 
+	SPDK_NOTICELOG("[TIMING] BEFORE spdk_sock_group_poll()\n");
 	num_events = spdk_sock_group_poll(group->sock_group);
+	SPDK_NOTICELOG("[TIMING] AFTER spdk_sock_group_poll() returned %d events\n", num_events);
+
 
 	STAILQ_FOREACH_SAFE(qpair, &tgroup->disconnected_qpairs, poll_group_stailq, tmp_qpair) {
 		tqpair = nvme_tcp_qpair(qpair);

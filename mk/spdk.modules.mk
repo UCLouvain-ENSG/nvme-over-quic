@@ -82,7 +82,7 @@ BLOCKDEV_MODULES_LIST += bdev_daos
 BLOCKDEV_MODULES_PRIVATE_LIBS += -ldaos -ldaos_common -ldfs -lgurt -luuid -ldl
 endif
 
-SOCK_MODULES_LIST = sock_posix
+SOCK_MODULES_LIST = sock_posix sock_udp
 
 ifeq ($(OS), Linux)
 ifeq ($(CONFIG_URING),y)

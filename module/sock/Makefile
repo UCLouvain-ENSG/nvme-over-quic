@@ -10,6 +10,7 @@ DIRS-y = posix
 ifeq ($(OS), Linux)
 DIRS-$(CONFIG_URING) += uring
 endif
+DIRS-$(CONFIG_QUIC) += udp
 
 .PHONY: all clean $(DIRS-y)
 

@@ -108,6 +108,9 @@ enum spdk_nvmf_trtype {
 
 	/** Intra-host transport (loopback) */
 	SPDK_NVMF_TRTYPE_INTRA_HOST	= 0xfe,
+
+	/** QUIC */
+	SPDK_NVMF_TRTYPE_QUIC		= 0x4,
 };
 
 /**
@@ -365,6 +368,13 @@ struct spdk_nvme_tcp_transport_specific_address_subtype {
 
 	uint8_t		reserved0[255];
 };
+
+/** QUIC Transport-specific address subtype */
+struct spdk_nvme_quic_transport_specific_address_subtype {
+	uint8_t		sectype;
+	uint8_t		reserved0[255];
+};
+
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_tcp_transport_specific_address_subtype) == 256,
 		   "Incorrect size");
 
@@ -377,6 +387,9 @@ union spdk_nvmf_transport_specific_address_subtype {
 
 	/** TCP */
 	struct spdk_nvme_tcp_transport_specific_address_subtype tcp;
+
+	/** QUIC */
+	struct spdk_nvme_quic_transport_specific_address_subtype quic;
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvmf_transport_specific_address_subtype) == 256,
 		   "Incorrect size");
@@ -869,6 +882,24 @@ SPDK_STATIC_ASSERT(offsetof(struct spdk_nvme_tcp_r2t_hdr, cccid) == 8, "Incorrec
 SPDK_STATIC_ASSERT(offsetof(struct spdk_nvme_tcp_r2t_hdr, ttag) == 10, "Incorrect offset");
 SPDK_STATIC_ASSERT(offsetof(struct spdk_nvme_tcp_r2t_hdr, r2to) == 12, "Incorrect offset");
 SPDK_STATIC_ASSERT(offsetof(struct spdk_nvme_tcp_r2t_hdr, r2tl) == 16, "Incorrect offset");
+
+
+
+/* QUIC transport specific definitions below */
+
+/**
+ * CapsuleCmd
+ *
+ * common.pdu_type == SPDK_NVME_TCP_PDU_TYPE_CAPSULE_CMD
+ */
+struct spdk_nvme_quic_cmd {
+	struct spdk_nvme_tcp_common_pdu_hdr	common;
+	struct spdk_nvme_cmd			ccsqe;
+	/**< icdoff hdgst padding + in-capsule data + ddgst (if enabled) */
+};
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_tcp_cmd) == 72, "Incorrect size");
+SPDK_STATIC_ASSERT(offsetof(struct spdk_nvme_tcp_cmd, ccsqe) == 8, "Incorrect offset");
+
 
 #pragma pack(pop)
 

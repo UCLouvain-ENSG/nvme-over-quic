@@ -839,6 +839,7 @@ SSL_readv(SSL *ssl, const struct iovec *iov, int iovcnt)
 	ssize_t total = 0;
 
 	for (i = 0; i < iovcnt; i++) {
+		// SPDK_NOTICELOG("SSL_read() into buffer %d, size %zu\n", i, iov[i].iov_len);
 		rc = SSL_read(ssl, iov[i].iov_base, iov[i].iov_len);
 
 		if (rc > 0) {
@@ -1415,6 +1416,8 @@ _sock_flush(struct spdk_sock *sock)
 
 	iovcnt = spdk_sock_prep_reqs(sock, iovs, 0, NULL, &flags);
 	if (iovcnt == 0) {
+		//SPDK_NOTICELOG("sendmsg() returned %zd, errno = %d\n", rc, errno);
+
 		return 0;
 	}
 
@@ -2178,11 +2181,13 @@ posix_sock_group_impl_poll(struct spdk_sock_group_impl *_group, int max_events,
 
 	assert(max_events > 0);
 
+	//SPDK_NOTICELOG("[TIMING-TCP] BEFORE epoll_wait(fd=%d, max_events=%d, timeout=0)\n", group->fd, max_events);
 #if defined(SPDK_EPOLL)
 	num_events = epoll_wait(group->fd, events, max_events, 0);
 #elif defined(SPDK_KEVENT)
 	num_events = kevent(group->fd, NULL, 0, events, max_events, &ts);
 #endif
+	//SPDK_NOTICELOG("[TIMING-TCP] AFTER epoll_wait() returned %d events\n", num_events);
 
 	if (num_events == -1) {
 		return -1;

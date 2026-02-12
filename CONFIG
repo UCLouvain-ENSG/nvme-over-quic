@@ -102,6 +102,10 @@ CONFIG_RDMA_PROV=verbs
 # Enable NVMe Character Devices.
 CONFIG_NVME_CUSE=y
 
+# Enable QUIC support for NVMe initiator.
+# Requires quicly library.
+CONFIG_QUIC=y
+
 # Enable FC support for the NVMf target.
 # Requires FC low level driver (from FC vendor)
 CONFIG_FC=n

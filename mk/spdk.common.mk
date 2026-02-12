@@ -202,6 +202,24 @@ endif
 endif
 endif
 
+ifeq ($(CONFIG_QUIC), y)
+QUICLY_DIR=$(SPDK_ROOT_DIR)/quicly
+QUICLY_BUILD_DIR=$(SPDK_ROOT_DIR)/quiclybuild
+COMMON_CFLAGS += -I$(QUICLY_DIR)/include -I$(QUICLY_DIR)/deps/picotls/include -I$(QUICLY_DIR)/deps/klib
+ifeq ($(CONFIG_SHARED),y)
+# quicly doesn't build shared libraries by default, use static
+SYS_LIBS += $(QUICLY_DIR)/libquicly.a
+else
+SYS_LIBS += $(QUICLY_DIR)/libquicly.a
+endif
+# Add picotls object files (they're not included in libquicly.a)
+SYS_LIBS += $(wildcard $(QUICLY_DIR)/CMakeFiles/cli.dir/deps/picotls/lib/*.o)
+# Add DTrace probe objects if they exist
+SYS_LIBS += $(wildcard $(QUICLY_DIR)/picotls-probes.o)
+# Add OpenSSL dependency (required by quicly)
+SYS_LIBS += -lssl -lcrypto
+endif
+
 ifeq ($(CONFIG_VFIO_USER), y)
 ifneq ($(CONFIG_VFIO_USER_DIR),)
 VFIO_USER_SRC_DIR=$(CONFIG_VFIO_USER_DIR)

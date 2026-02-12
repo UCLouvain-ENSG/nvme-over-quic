@@ -31,6 +31,7 @@ extern "C" {
 #define SPDK_NVME_TRANSPORT_NAME_TCP		"TCP"
 #define SPDK_NVME_TRANSPORT_NAME_VFIOUSER	"VFIOUSER"
 #define SPDK_NVME_TRANSPORT_NAME_CUSTOM		"CUSTOM"
+#define SPDK_NVME_TRANSPORT_NAME_QUIC		"QUIC"
 
 #define SPDK_NVMF_PRIORITY_MAX_LEN 4
 
@@ -467,6 +468,11 @@ enum spdk_nvme_transport_type {
 	 * Custom Fabric Transport (Not spec defined)
 	 */
 	SPDK_NVME_TRANSPORT_CUSTOM_FABRICS = 4097,
+
+	/**
+	 * QUIC Transport
+	 */
+	SPDK_NVME_TRANSPORT_QUIC = SPDK_NVMF_TRTYPE_QUIC,
 };
 
 static inline bool spdk_nvme_trtype_is_fabrics(enum spdk_nvme_transport_type trtype)
@@ -598,6 +604,16 @@ struct spdk_nvme_tcp_stat {
 	uint64_t queued_requests;
 };
 
+struct spdk_nvme_quic_stat {
+	uint64_t polls;
+	uint64_t idle_polls;
+	uint64_t socket_completions;
+	uint64_t nvme_completions;
+	uint64_t submitted_requests;
+	uint64_t queued_requests;
+};
+
+
 struct spdk_nvme_transport_poll_group_stat {
 	spdk_nvme_transport_type_t trtype;
 	union {
@@ -607,6 +623,7 @@ struct spdk_nvme_transport_poll_group_stat {
 		} rdma;
 		struct spdk_nvme_pcie_stat pcie;
 		struct spdk_nvme_tcp_stat tcp;
+		struct spdk_nvme_quic_stat quic;
 	};
 };
 
