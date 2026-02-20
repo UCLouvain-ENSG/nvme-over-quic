@@ -62,6 +62,8 @@ function usage() {
 	echo "                           Implies --without-dpdk."
 	echo " --with-idxd               Build the IDXD library and accel framework plug-in module."
 	echo " --without-idxd            Disabled while experimental. Only built for x86 when enabled."
+	echo " --with-ebpf               Build with eBPF SO_REUSEPORT support for UDP sockets."
+	echo " --without-ebpf            Requires libbpf-dev and clang. No path required."
 	echo " --with-crypto             Build isa-l-crypto and vbdev crypto module. No path required."
 	echo " --without-crypto          Disable isa-l-crypto and vbdev crypto module."
 	echo " --with-fio[=DIR]          Build fio_plugin."
@@ -648,6 +650,12 @@ for i in "$@"; do
 			;;
 		--without-idxd)
 			CONFIG[IDXD]=n
+			;;
+		--with-ebpf)
+			CONFIG[EBPF]=y
+			;;
+		--without-ebpf)
+			CONFIG[EBPF]=n
 			;;
 		--with-usdt)
 			CONFIG[USDT]=y

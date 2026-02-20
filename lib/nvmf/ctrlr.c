@@ -840,8 +840,8 @@ nvmf_qpair_access_allowed(struct spdk_nvmf_qpair *qpair, struct spdk_nvmf_subsys
 		return false;
 	}
 
-	SPDK_ERRLOG("Access check: listen_trid trtype=%d, adrfam=%d, traddr='%s', trsvcid='%s'\n",
-		    listen_trid.trtype, listen_trid.adrfam, listen_trid.traddr, listen_trid.trsvcid);
+	// SPDK_DEBUGLOG("Access check: listen_trid trtype=%d, adrfam=%d, traddr='%s', trsvcid='%s'\n",
+	// 	    listen_trid.trtype, listen_trid.adrfam, listen_trid.traddr, listen_trid.trsvcid);
 
 	if (!spdk_nvmf_subsystem_listener_allowed(subsystem, &listen_trid)) {
 		SPDK_ERRLOG("Subsystem '%s' does not allow host '%s' to connect at this address.\n",

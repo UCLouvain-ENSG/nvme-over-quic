@@ -187,6 +187,10 @@ CONFIG_OPENSSL_PATH=
 # Build with RAID5f support
 CONFIG_RAID5F=n
 
+# Build with eBPF SO_REUSEPORT support for UDP sockets
+# Requires libbpf-dev and clang
+CONFIG_EBPF=n
+
 # Build with IDXD support
 # In this mode, SPDK fully controls the DSA device.
 CONFIG_IDXD=n

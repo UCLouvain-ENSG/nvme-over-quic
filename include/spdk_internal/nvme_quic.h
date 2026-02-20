@@ -614,6 +614,22 @@ nvme_quic_parse_interchange_psk(const char *psk_in, uint8_t *psk_out, size_t psk
 	return rc;
 }
 
+/**
+ * Create a plaintext (unencrypted) CID encryptor for NVMe-oF QUIC.
+ * 
+ * This encryptor directly embeds the thread_id in the CID bytes without encryption,
+ * allowing eBPF to extract it for SO_REUSEPORT load balancing.
+ *
+ * @return Pointer to CID encryptor, or NULL on allocation failure
+ */
+quicly_cid_encryptor_t *nvme_quic_new_plaintext_cid_encryptor(void);
+
+/**
+ * Free a plaintext CID encryptor created by nvme_quic_new_plaintext_cid_encryptor.
+ *
+ * @param encryptor Pointer to the encryptor to free
+ */
+void nvme_quic_free_plaintext_cid_encryptor(quicly_cid_encryptor_t *encryptor);
 
 
 #endif /* SPDK_INTERNAL_NVME_QUIC_H */

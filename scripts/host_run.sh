@@ -66,7 +66,7 @@ if [ "$MODE_LOWER" = "quic" ]; then
     echo "  Core Mask: $CORE_MASK"
     
     sudo gdb --batch -ex 'set pagination off' \
-        -ex "run -m $CORE_MASK -q $QUEUE_DEPTH -o $BLOCK_SIZE -w $WORKLOAD -t $TIME $LOG_LEVEL_OPT --psk-path /tmp/nvme_quic_psk.key -r \"trtype:QUIC adrfam:IPv4 traddr:127.0.0.1 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 hostnqn:nqn.2016-06.io.spdk:host1\"" \
+        -ex "run -c $CORE_MASK -q $QUEUE_DEPTH -o $BLOCK_SIZE -w $WORKLOAD -t $TIME $LOG_LEVEL_OPT --psk-path /tmp/nvme_quic_psk.key -r \"trtype:QUIC adrfam:IPv4 traddr:127.0.0.1 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 hostnqn:nqn.2016-06.io.spdk:host1\"" \
         -ex 'bt 15' -ex 'quit' ./spdk_nvme_perf 2>&1 | tee "$LOGFILE"
 
 elif [ "$MODE_LOWER" = "tcp" ]; then
@@ -80,7 +80,7 @@ elif [ "$MODE_LOWER" = "tcp" ]; then
     echo "  Core Mask: $CORE_MASK"
     
     sudo gdb --batch -ex 'set pagination off' \
-        -ex "run -m $CORE_MASK -S ssl -q $QUEUE_DEPTH -o $BLOCK_SIZE -w $WORKLOAD -t $TIME $LOG_LEVEL_OPT --psk-path /tmp/nvme_psk.key -r \"trtype:TCP adrfam:IPv4 traddr:127.0.0.1 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 hostnqn:nqn.2016-06.io.spdk:host1\"" \
+        -ex "run -c $CORE_MASK -S ssl -q $QUEUE_DEPTH -o $BLOCK_SIZE -w $WORKLOAD -t $TIME $LOG_LEVEL_OPT --psk-path /tmp/nvme_psk.key -r \"trtype:TCP adrfam:IPv4 traddr:127.0.0.1 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 hostnqn:nqn.2016-06.io.spdk:host1\"" \
         -ex 'bt 15' -ex 'quit' ./spdk_nvme_perf 2>&1 | tee "$LOGFILE"
 
 else

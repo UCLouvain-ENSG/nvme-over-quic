@@ -18,7 +18,7 @@ all:
 	@echo "Building quicly with CMake..."
 	$(Q)cd $(QUICLY_DIR) && \
 		if [ ! -f Makefile ]; then \
-			cmake -DCMAKE_BUILD_TYPE=Release . $(REDIRECT); \
+			cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON . $(REDIRECT); \
 		fi
 	$(Q)$(MAKE) -C $(QUICLY_DIR) $(REDIRECT)
 

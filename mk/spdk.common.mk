@@ -173,6 +173,10 @@ LDFLAGS += -L$(CONFIG_URING_PATH)/lib
 endif
 endif
 
+ifeq ($(CONFIG_EBPF),y)
+SYS_LIBS += -lbpf
+endif
+
 ifeq ($(CONFIG_AVAHI),y)
 SYS_LIBS += -lavahi-common -lavahi-client
 endif

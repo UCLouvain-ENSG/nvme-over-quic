@@ -385,6 +385,10 @@ struct spdk_nvmf_quic_poll_group {
 	struct spdk_io_channel			*accel_channel;
 	struct spdk_nvmf_quic_control_msg_list	*control_msg_list;
 
+	/* Per-poll-group CID generator for server-side connections
+	 * Each poll group has unique thread_id to enable eBPF routing */
+	quicly_cid_plaintext_t			next_cid;
+
 	TAILQ_ENTRY(spdk_nvmf_quic_poll_group)	link;
 };
 
@@ -433,6 +437,9 @@ struct spdk_nvmf_quic_transport {
 	quicly_cid_plaintext_t next_cid;
 
 	struct spdk_nvmf_quic_poll_group		*next_pg;
+
+	/* Counter for assigning unique thread_ids to poll groups (for eBPF routing) */
+	uint32_t				next_thread_id;
 
 	struct spdk_poller			*accept_poller;
 	struct spdk_sock_group			*listen_sock_group;
@@ -541,7 +548,7 @@ nvmf_quic_qpair_init(struct spdk_nvmf_qpair *qpair)
 	struct spdk_nvmf_quic_qpair *qqpair;
 
 	qqpair = SPDK_CONTAINEROF(qpair, struct spdk_nvmf_quic_qpair, qpair);
-	SPDK_DEBUGLOG(nvmf,"New QUIC Connection: %p\n", qpair);
+	SPDK_DEBUGLOG(nvmf,"New QUIC Connection: %p on reactor %u\n", qpair, spdk_env_get_current_core());
 
 	spdk_trace_record(TRACE_QUIC_QP_CREATE, qqpair->qpair.trace_id, 0, 0);
 
@@ -568,16 +575,16 @@ nvmf_quic_qpair_sock_init(struct spdk_nvmf_quic_qpair *qqpair)
 	/* For server-side accepted connections, sock is a listening UDP socket
 	 * which doesn't have a connected peer address. Skip getaddr. */
 	if (qqpair->group != NULL) {
-		SPDK_DEBUGLOG(nvmf,"Qpair already has group assigned, skipping sock_init\n");
+		SPDK_DEBUGLOG(nvmf,"Qpair already has group assigned on reactor %u, skipping sock_init\n", spdk_env_get_current_core());
 		return 0;
 	}
 
-	rc = spdk_sock_getaddr(qqpair->sock, saddr, sizeof(saddr), &sport,
-			       caddr, sizeof(caddr), &cport);
-	if (rc != 0) {
-		SPDK_ERRLOG("spdk_sock_getaddr() failed\n");
-		return rc;
-	}
+	// rc = spdk_sock_getaddr(qqpair->sock, saddr, sizeof(saddr), &sport,
+	// 		       caddr, sizeof(caddr), &cport);
+	// if (rc != 0) {
+	// 	SPDK_ERRLOG("spdk_sock_getaddr() failed\n");
+	// 	return rc;
+	// }
 	/* update buffer size for owner when changing format or arguments here */
 	snprintf(owner, sizeof(owner), "%s:%d", caddr, cport);
 	qqpair->qpair.trace_id = spdk_trace_register_owner(OWNER_TYPE_NVMF_QUIC, owner);
@@ -585,7 +592,7 @@ nvmf_quic_qpair_sock_init(struct spdk_nvmf_quic_qpair *qqpair)
 	/* set low water mark */
 	rc = spdk_sock_set_recvlowat(qqpair->sock, 1);
 	if (rc != 0) {
-		SPDK_ERRLOG("spdk_sock_set_recvlowat() failed\n");
+		SPDK_ERRLOG("spdk_sock_set_recvlowat() failed on reactor %u\n", spdk_env_get_current_core());
 		return rc;
 	}
 
@@ -610,21 +617,21 @@ nvmf_quic_qpair_init_mem_resource(struct spdk_nvmf_quic_qpair *qqpair)
 
 	qqpair->reqs = calloc(qqpair->resource_count, sizeof(*qqpair->reqs));
 	if(qqpair->reqs == NULL) {
-		SPDK_ERRLOG("Failed to allocate memory for QUIC requests\n");
+		SPDK_ERRLOG("Failed to allocate memory for QUIC requests on reactor %u\n", spdk_env_get_current_core());
 		return -1;
 	}
 
 	if(in_capsule_data_size) {
 		qqpair->bufs = spdk_zmalloc(qqpair->resource_count * in_capsule_data_size, 0x1000, NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 		if(!qqpair->bufs) {
-			SPDK_ERRLOG("Failed to allocate memory for QUIC in-capsule data buffers\n");
+			SPDK_ERRLOG("Failed to allocate memory for QUIC in-capsule data buffers on reactor %u\n", spdk_env_get_current_core());
 			return -1;
 		}
 	}
 
 	qqpair->streams = spdk_dma_zmalloc((2*qqpair->resource_count + 1) * sizeof(*qqpair->streams), 0x1000, NULL);
 	if (!qqpair->streams) {
-		SPDK_ERRLOG("Failed to allocate memory for QUIC streams\n");
+		SPDK_ERRLOG("Failed to allocate memory for QUIC streams on reactor %u\n", spdk_env_get_current_core());
 		return -1;
 	}
 
@@ -674,13 +681,13 @@ nvmf_quic_qpair_set_recv_state(struct spdk_nvmf_quic_qpair *qqpair,
 			      enum nvme_quic_stream_recv_state state)
 {
 	if (qqpair->recv_state == state) {
-		SPDK_ERRLOG("The recv state of qqpair=%p is same with the state(%d) to be set\n",
-			    qqpair, state);
+		SPDK_ERRLOG("The recv state of qqpair=%p is same with the state(%d) to be set on reactor %u\n",
+			    qqpair, state, spdk_env_get_current_core());
 		return;
 	}
 
 
-	SPDK_DEBUGLOG(nvmf,"qqpair(%p) recv state=%d\n", qqpair, state);
+	SPDK_DEBUGLOG(nvmf,"qqpair(%p) recv state=%d on reactor %u\n", qqpair, state, spdk_env_get_current_core());
 	qqpair->recv_state = state;
 	spdk_trace_record(TRACE_QUIC_QP_RCV_STATE_CHANGE, qqpair->qpair.trace_id, 0, 0,
 			  (uint64_t)qqpair->recv_state);
@@ -712,14 +719,18 @@ nvmf_quic_add_qpair_to_hash(struct spdk_nvmf_quic_poll_group *qgroup,
 	uint64_t hash = nvmf_quic_hash_cid(cid->cid, cid->len);
 	uint32_t bucket = hash % QUIC_CID_HASH_SIZE;
 	
+	/* Log FULL CID being hashed */
+	char cid_hex[64] = {0};
+	for (size_t i = 0; i < cid->len && i < 20; i++) {
+		sprintf(cid_hex + i*2, "%02x", cid->cid[i]);
+	}
+	
 	qqpair->cid_hash = hash;
 	qqpair->in_hash_table = true;
 	TAILQ_INSERT_TAIL(&qgroup->cid_hash[bucket].qpairs, qqpair, cid_hash_link);
 	
-	SPDK_DEBUGLOG(nvmf,"Added qpair %p to hash bucket %u (hash=0x%lx, CID len=%u, bytes=%02x%02x%02x%02x%02x%02x%02x%02x)\n", 
-		       qqpair, bucket, hash, cid->len,
-		       cid->cid[0], cid->cid[1], cid->cid[2], cid->cid[3],
-		       cid->cid[4], cid->cid[5], cid->cid[6], cid->cid[7]);
+	SPDK_DEBUGLOG(nvmf, "HASH_ADD: qpair=%p, bucket=%u, hash=0x%lx, CID len=%u, FULL_CID=%s on reactor %u\n", 
+		       qqpair, bucket, hash, cid->len, cid_hex, spdk_env_get_current_core());
 }
 
 /* Remove qpair from CID hash table */
@@ -738,7 +749,7 @@ nvmf_quic_remove_qpair_from_hash(struct spdk_nvmf_quic_poll_group *qgroup,
 }
 
 
-/* This is called after qpair is created */
+/* This is called after qpair is created, normall it would be called after choosing the load-balanced group(=thread). */
 static int
 nvmf_quic_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 			 struct spdk_nvmf_qpair *qpair)
@@ -753,19 +764,19 @@ nvmf_quic_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 
 	rc = nvmf_quic_qpair_sock_init(qqpair);
 	if (rc != 0) {
-		SPDK_ERRLOG("nvmf_quic_qpair_sock_init failed\n");
+		SPDK_ERRLOG("nvmf_quic_qpair_sock_init failed on reactor %u\n", spdk_env_get_current_core());
 		return -1;
 	}
 
 	rc = nvmf_quic_qpair_init(&qqpair->qpair);
 	if (rc != 0) {
-		SPDK_ERRLOG("nvmf_quic_qpair_init failed\n");
+		SPDK_ERRLOG("nvmf_quic_qpair_init failed on reactor %u\n", spdk_env_get_current_core());
 		return -1;
 	}
 
 	rc = nvmf_quic_qpair_init_mem_resource(qqpair);
 	if (rc != 0) {
-		SPDK_ERRLOG("nvmf_quic_qpair_init_mem_resource failed\n");
+		SPDK_ERRLOG("nvmf_quic_qpair_init_mem_resource failed on reactor %u\n", spdk_env_get_current_core());
 		return -1;
 	}
 
@@ -795,7 +806,7 @@ nvmf_quic_poll_group_poll(struct spdk_nvmf_transpot_poll_group *group)
 
 	num_events = spdk_sock_group_poll(qgroup->sock_group);
 	if(spdk_unlikely(num_events < 0)) {
-		SPDK_ERRLOG("Failed to poll sock_group=%p\n", qgroup->sock_group);
+		SPDK_ERRLOG("Failed to poll sock_group=%p on reactor %u\n", qgroup->sock_group, spdk_env_get_current_core());
 	}
 
 	/* Send all pending responses */
@@ -827,7 +838,7 @@ nvmf_quic_request_get_buffers_abort(struct spdk_nvmf_quic_req *quic_req)
 	}
 
 	if (!nvmf_request_get_buffers_abort(&quic_req->req)) {
-		SPDK_ERRLOG("Failed to abort quic_req=%p\n", quic_req);
+		SPDK_ERRLOG("Failed to abort quic_req=%p on reactor %u\n", quic_req, spdk_env_get_current_core());
 		assert(0 && "Should never happen");
 	}
 }
@@ -861,7 +872,7 @@ nvmf_quic_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 
 	assert(qqpair->group == qgroup);
 
-	SPDK_DEBUGLOG(nvmf,"Removing qpair %p from poll group %p\n", qqpair, qgroup);
+	SPDK_DEBUGLOG(nvmf,"Removing qpair %p from poll group %p on reactor %u\n", qqpair, qgroup, spdk_env_get_current_core());
 	if(qqpair->recv_state == NVME_QUIC_RECV_STATE_AWAIT_REQ) {
 		/* Check if it's needed after implementation */
 		nvmf_quic_qpair_set_recv_state(qqpair, NVME_QUIC_RECV_STATE_QUIESCING);
@@ -875,7 +886,7 @@ nvmf_quic_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 	/* Remove socket from sock group before destroying qpair */
 	rc = spdk_sock_group_remove_sock(qgroup->sock_group, qqpair->sock);
 	if (rc != 0) {
-		SPDK_ERRLOG("spdk_sock_group_remove_sock failed\n");
+		SPDK_ERRLOG("spdk_sock_group_remove_sock failed on reactor %u\n", spdk_env_get_current_core());
 	}
 
 	nvmf_quic_abort_await_buffer_reqs(qqpair);
@@ -944,13 +955,13 @@ quic_sock_get_key(uint8_t *out, int out_len, const char **cipher, const char *ps
 
 		psk_len = entry->psk_size;
 		if((size_t)out_len < psk_len) {
-			SPDK_ERRLOG("PSK buffer too small\n");
+			SPDK_ERRLOG("PSK buffer too small on reactor %u\n", spdk_env_get_current_core());
 			return -ENOBUFS;
 		}
 
 		rc = nvme_quic_derive_tls_psk(entry->psk, psk_len, pskid, out, out_len, entry->tls_cipher_suite);
 		if (rc < 0) {
-			SPDK_ERRLOG("Failed to derive TLS PSK\n");
+			SPDK_ERRLOG("Failed to derive TLS PSK on reactor %u\n", spdk_env_get_current_core());
 			return rc;
 		}
 
@@ -969,7 +980,7 @@ quic_sock_get_key(uint8_t *out, int out_len, const char **cipher, const char *ps
 		return rc;
 	}
 
-	SPDK_ERRLOG("No matching PSK entry for pskid '%s'\n", pskid);
+	SPDK_ERRLOG("No matching PSK entry for pskid '%s' on reactor %u\n", pskid, spdk_env_get_current_core());
 	return -EINVAL;
 }
 
@@ -984,11 +995,11 @@ nvmf_quic_accept(void *ctx)
 
 	count = spdk_sock_group_poll(qtransport->listen_sock_group);
 	if (count > 0) {
-		SPDK_DEBUGLOG(nvmf,"nvmf_quic_accept: GOT %d EVENTS from listen_sock_group=%p!\n", 
-		              count, qtransport->listen_sock_group);
+		SPDK_DEBUGLOG(nvmf,"nvmf_quic_accept: GOT %d EVENTS from listen_sock_group=%p on reactor %u!\n", 
+		              count, qtransport->listen_sock_group, spdk_env_get_current_core());
 	}
 	if (count < 0) {
-		SPDK_ERRLOG("spdk_sock_group_poll failed\n");
+		SPDK_ERRLOG("spdk_sock_group_poll failed on reactor %u\n", spdk_env_get_current_core());
 	}
 
 	return count != 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
@@ -1117,27 +1128,39 @@ nvmf_quic_find_qpair_by_decoded_cid(struct spdk_nvmf_quic_poll_group *qgroup,
 	
 	if (cid_len == 0) {
 		/* No CID - this shouldn't happen for server */
-		SPDK_DEBUGLOG(nvmf,"Packet has no CID\n");
+		SPDK_DEBUGLOG(nvmf,"Packet has no CID on reactor %u\n", spdk_env_get_current_core());
 		return NULL;
 	}
 	
 	hash = nvmf_quic_hash_cid(cid_data, cid_len);
 	bucket = hash % QUIC_CID_HASH_SIZE;
 	
-	SPDK_DEBUGLOG(nvmf,"Looking up qpair: hash=0x%lx, bucket=%u, CID len=%zu, bytes=%02x%02x%02x%02x%02x%02x%02x%02x\n", 
-		       hash, bucket, cid_len,
-		       cid_data[0], cid_data[1], cid_data[2], cid_data[3],
-		       cid_data[4], cid_data[5], cid_data[6], cid_data[7]);
+	/* Log FULL CID being hashed for lookup */
+	char lookup_cid_hex[64] = {0};
+	for (size_t i = 0; i < cid_len && i < 20; i++) {
+		sprintf(lookup_cid_hex + i*2, "%02x", cid_data[i]);
+	}
 	
+	SPDK_DEBUGLOG(nvmf, "HASH_LOOKUP: hash=0x%lx, bucket=%u, CID len=%zu, FULL_CID=%s on reactor %u\n", 
+		       hash, bucket, cid_len, lookup_cid_hex, spdk_env_get_current_core());
+	
+	/* Iterate through qpairs in this bucket */
+	int qpair_count = 0;
 	TAILQ_FOREACH(qqpair, &qgroup->cid_hash[bucket].qpairs, cid_hash_link) {
+		qpair_count++;
+		SPDK_DEBUGLOG(nvmf, "  Bucket[%u] entry %d: qqpair=%p, stored_hash=0x%lx, match=%s on reactor %u\n",
+			       bucket, qpair_count, qqpair, qqpair->cid_hash,
+			       (qqpair->cid_hash == hash) ? "YES" : "NO", spdk_env_get_current_core());
 		if (qqpair->cid_hash == hash) {
 			/* TODO: For collision safety, compare actual CID bytes
 			 * Can get from qqpair->conn via quicly API */
-			SPDK_DEBUGLOG(nvmf,"Found qpair %p with matching hash\n", qqpair);
+			SPDK_DEBUGLOG(nvmf, "Found qpair %p with matching hash on reactor %u!\n", qqpair, spdk_env_get_current_core());
 			return qqpair;
 		}
 	}
 	
+	SPDK_DEBUGLOG(nvmf, "Hash lookup FAILED: searched %d qpairs in bucket %u, none matched hash 0x%lx on reactor %u\n",
+		       qpair_count, bucket, hash, spdk_env_get_current_core());
 	return NULL;
 }
 
@@ -1239,7 +1262,17 @@ nvmf_quic_qpair_create(struct spdk_nvmf_quic_poll_group *qgroup,
 	qtransport = SPDK_CONTAINEROF(qgroup->group.transport, struct spdk_nvmf_quic_transport, transport);
 
 	/* Context is now shared at qgroup level - no per-qpair TLS/QUIC setup needed */
+	qqpair->group = qgroup;
+	TAILQ_INSERT_TAIL(&qgroup->qpairs, qqpair, link);
+	SPDK_DEBUGLOG(nvmf,"Added qpair %p to poll group qpairs list on reactor %u\n", qqpair, spdk_env_get_current_core());
+	nvmf_quic_qpair_set_state(qqpair, NVMF_QUIC_QPAIR_STATE_RUNNING);
 
+
+	/* 
+		Determine which thread would be handled for this qpair.
+		Normally the group(=thread) would be picked by pre-defined load balancing strategy, but for QUIC every socket of core has responsibility to accept new connections, so the group is determined by the socket which receives the first packet.
+		So, we can directly use the group assigned to the socket for accepted connection, which is the same group for the listener. 
+	*/
 	spdk_nvmf_tgt_new_qpair(qgroup->group.transport->tgt, &qqpair->qpair);
 	return qqpair;
 }
@@ -1346,8 +1379,8 @@ nvmf_quic_req_parse_sgl(struct spdk_nvmf_quic_req *quic_req,
 		/* get request length from sgl */
 		length = sgl->unkeyed.length;
 		if (spdk_unlikely(length > transport->opts.max_io_size)) {
-			SPDK_ERRLOG("SGL length 0x%x exceeds max io size 0x%x\n",
-				    length, transport->opts.max_io_size);
+			SPDK_ERRLOG("SGL length 0x%x exceeds max io size 0x%x on reactor %u\n",
+				    length, transport->opts.max_io_size, spdk_env_get_current_core());
 			fes = SPDK_NVME_QUIC_TERM_REQ_FES_DATA_TRANSFER_LIMIT_EXCEEDED;
 			goto fatal_err;
 		}
@@ -1355,7 +1388,7 @@ nvmf_quic_req_parse_sgl(struct spdk_nvmf_quic_req *quic_req,
 		/* fill request length and populate iovs */
 		req->length = length;
 
-		SPDK_DEBUGLOG(nvmf,"Data requested length= 0x%x\n", length);
+		SPDK_DEBUGLOG(nvmf,"Data requested length= 0x%x on reactor %u\n", length, spdk_env_get_current_core());
 
 		if (spdk_unlikely(req->dif_enabled)) {
 			req->dif.orig_length = length;
@@ -1364,7 +1397,7 @@ nvmf_quic_req_parse_sgl(struct spdk_nvmf_quic_req *quic_req,
 		}
 
 		if (nvmf_ctrlr_use_zcopy(req)) {
-			SPDK_DEBUGLOG(nvmf,"Using zero-copy to execute request %p\n", quic_req);
+			SPDK_DEBUGLOG(nvmf,"Using zero-copy to execute request %p on reactor %u\n", quic_req, spdk_env_get_current_core());
 			req->data_from_pool = false;
 			nvmf_quic_req_set_state(quic_req, QUIC_REQUEST_STATE_HAVE_BUFFER);
 			return;
@@ -1372,14 +1405,14 @@ nvmf_quic_req_parse_sgl(struct spdk_nvmf_quic_req *quic_req,
 
 		if (spdk_nvmf_request_get_buffers(req, group, transport, length)) {
 			/* No available buffers. Queue this request up. */
-			SPDK_DEBUGLOG(nvmf,"No available large data buffers. Queueing request %p\n",
-				      quic_req);
+			SPDK_DEBUGLOG(nvmf,"No available large data buffers. Queueing request %p on reactor %u\n",
+				      quic_req, spdk_env_get_current_core());
 			return;
 		}
 
 		nvmf_quic_req_set_state(quic_req, QUIC_REQUEST_STATE_HAVE_BUFFER);
-		SPDK_DEBUGLOG(nvmf,"Request %p took %d buffer/s from central pool, and data=%p\n",
-			      quic_req, req->iovcnt, req->iov[0].iov_base);
+		SPDK_DEBUGLOG(nvmf,"Request %p took %d buffer/s from central pool, and data=%p on reactor %u\n",
+			      quic_req, req->iovcnt, req->iov[0].iov_base, spdk_env_get_current_core());
 
 		return;
 	} else if (sgl->generic.type == SPDK_NVME_SGL_TYPE_DATA_BLOCK &&
@@ -1393,19 +1426,19 @@ nvmf_quic_req_parse_sgl(struct spdk_nvmf_quic_req *quic_req,
 
 		/* This error is not defined in NVMe/TCP spec, take this error as fatal error */
 		if (spdk_unlikely(length != sgl->unkeyed.length)) {
-			SPDK_ERRLOG("In-Capsule Data length 0x%x is not equal to SGL data length 0x%x\n",
-				    length, sgl->unkeyed.length);
+			SPDK_ERRLOG("In-Capsule Data length 0x%x is not equal to SGL data length 0x%x on reactor %u\n",
+				    length, sgl->unkeyed.length, spdk_env_get_current_core());
 			fes = SPDK_NVME_QUIC_TERM_REQ_FES_INVALID_HEADER_FIELD;
 			goto fatal_err;
 		}
 
-		SPDK_DEBUGLOG(nvmf,"In-capsule data: offset 0x%" PRIx64 ", length 0x%x\n",
-			      offset, length);
+		SPDK_DEBUGLOG(nvmf,"In-capsule data: offset 0x%" PRIx64 ", length 0x%x on reactor %u\n",
+			      offset, length, spdk_env_get_current_core());
 
 		/* The NVMe/QUIC transport does not use ICDOFF to control the in-capsule data offset. ICDOFF should be '0' */
 		if (spdk_unlikely(offset != 0)) {
 			/* Not defined fatal error in NVMe/QUIC spec, handle this error as a fatal error */
-			SPDK_ERRLOG("In-capsule offset 0x%" PRIx64 " should be ZERO in NVMe/QUIC\n", offset);
+			SPDK_ERRLOG("In-capsule offset 0x%" PRIx64 " should be ZERO in NVMe/QUIC on reactor %u\n", offset, spdk_env_get_current_core());
 			fes = SPDK_NVME_QUIC_TERM_REQ_FES_INVALID_DATA_UNSUPPORTED_PARAMETER;
 			error_offset = offsetof(struct spdk_nvme_quic_cmd, ccsqe.dptr.sgl1.address);
 			goto fatal_err;
@@ -1417,19 +1450,19 @@ nvmf_quic_req_parse_sgl(struct spdk_nvmf_quic_req *quic_req,
 			    (cmd->opc == SPDK_NVME_OPC_FABRIC || req->qpair->qid == 0)) {
 
 				/* Get a buffer from dedicated list */
-				SPDK_DEBUGLOG(nvmf,"Getting a buffer from control msg list\n");
+				SPDK_DEBUGLOG(nvmf,"Getting a buffer from control msg list on reactor %u\n", spdk_env_get_current_core());
 				qgroup = SPDK_CONTAINEROF(group, struct spdk_nvmf_quic_poll_group, group);
 				assert(qgroup->control_msg_list);
 				req->iov[0].iov_base = nvmf_quic_control_msg_get(qgroup->control_msg_list, quic_req);
 				if (!req->iov[0].iov_base) {
 					/* No available buffers. Queue this request up. */
-					SPDK_DEBUGLOG(nvmf,"No available ICD buffers. Queueing request %p\n", quic_req);
+					SPDK_DEBUGLOG(nvmf,"No available ICD buffers. Queueing request %p on reactor %u\n", quic_req, spdk_env_get_current_core());
 					nvmf_quic_stream_set_state(qqpair, NVME_QUIC_RECV_STATE_AWAIT_PDU_BUF);
 					return;
 				}
 			} else {
-				SPDK_ERRLOG("In-capsule data length 0x%x exceeds capsule length 0x%x\n",
-					    length, max_len);
+				SPDK_ERRLOG("In-capsule data length 0x%x exceeds capsule length 0x%x on reactor %u\n",
+					    length, max_len, spdk_env_get_current_core());
 				fes = SPDK_NVME_QUIC_TERM_REQ_FES_DATA_TRANSFER_LIMIT_EXCEEDED;
 				goto fatal_err;
 			}
@@ -1453,8 +1486,8 @@ nvmf_quic_req_parse_sgl(struct spdk_nvmf_quic_req *quic_req,
 	}
 	/* If we want to handle the problem here, then we can't skip the following data segment.
 	 * Because this function runs before reading data part, now handle all errors as fatal errors. */
-	SPDK_ERRLOG("Invalid NVMf I/O Command SGL:  Type 0x%x, Subtype 0x%x\n",
-		    sgl->generic.type, sgl->generic.subtype);
+	SPDK_ERRLOG("Invalid NVMf I/O Command SGL:  Type 0x%x, Subtype 0x%x on reactor %u\n",
+		    sgl->generic.type, sgl->generic.subtype, spdk_env_get_current_core());
 	fes = SPDK_NVME_QUIC_TERM_REQ_FES_INVALID_DATA_UNSUPPORTED_PARAMETER;
 	error_offset = offsetof(struct spdk_nvme_quic_cmd, ccsqe.dptr.sgl1.generic);
 fatal_err:
@@ -1525,9 +1558,9 @@ _nvmf_quic_send_pending(struct spdk_nvmf_quic_qpair *qqpair)
 		} else {
 			SPDK_ERRLOG("dest.sa.sa_family=%d (not AF_INET or AF_INET6!)\n", dest.sa.sa_family);
 		}
-		SPDK_DEBUGLOG(nvmf,"SERVER: Sending %zu packets to dest=%s:%u (qpair initiator=%s:%u), socklen=%d\n",
+		SPDK_DEBUGLOG(nvmf,"SERVER: Sending %zu packets to dest=%s:%u (qpair initiator=%s:%u) on reactor %u, socklen=%d\n",
 			       num_packets, dest_str, dest_port, qqpair->initiator_addr, qqpair->initiator_port,
-			       quicly_get_socklen(&dest.sa));
+			       spdk_env_get_current_core(), quicly_get_socklen(&dest.sa));
 	}
 	
 	for(int i=0; i<num_packets; i++) {
@@ -1744,7 +1777,7 @@ nvmf_quic_send_capsule_resp(struct spdk_nvmf_quic_req *quic_req,
 	int ret;
 	
 	if (!quic_req || !quic_req->stream || !quic_req->stream->quic_stream) {
-		SPDK_ERRLOG("Invalid request or stream in send_capsule_resp\n");
+		SPDK_ERRLOG("Invalid request or stream in send_capsule_resp on reactor %u\n", spdk_env_get_current_core());
 		return;
 	}
 	
@@ -1779,12 +1812,12 @@ nvmf_quic_send_capsule_resp(struct spdk_nvmf_quic_req *quic_req,
 
 	ret = quicly_streambuf_egress_write_vec(send_stream, &quic_req->stream->rsp_buf);
 	if (ret != 0) {
-		SPDK_ERRLOG("Failed to write response to stream %p: ret=%d\n", send_stream, ret);
+		SPDK_ERRLOG("Failed to write response to stream %p: ret=%d on reactor %u\n", send_stream, ret, spdk_env_get_current_core());
 		return;
 	}
 	quicly_streambuf_egress_shutdown(send_stream);
 	
-	SPDK_DEBUGLOG(nvmf_quic, "Response queued successfully on stream %p, ret=%d\n", send_stream, ret);
+	SPDK_DEBUGLOG(nvmf_quic, "Response queued successfully on stream %p, ret=%d on reactor %u\n", send_stream, ret, spdk_env_get_current_core());
 	
 	/* Mark that this qpair has pending data to send */
 	
@@ -2591,8 +2624,8 @@ nvmf_quic_datagram_cb(void *arg, struct spdk_sock_group *group, struct spdk_sock
 	struct sockaddr_storage local_addr, remote_addr;
 	socklen_t local_len, remote_len;
 
-	SPDK_DEBUGLOG(nvmf,"nvmf_quic_datagram_cb: CALLBACK INVOKED! sock=%p, group=%p, qgroup=%p\n",
-	              sock, group, qgroup);
+	SPDK_DEBUGLOG(nvmf,"nvmf_quic_datagram_cb: CALLBACK INVOKED! sock=%p, group=%p, qgroup=%p, thread_id=%lu, reactor=%u\n",
+	              sock, group, qgroup, spdk_thread_get_id(spdk_get_thread()), spdk_env_get_current_core());
 
 	enum nvme_quic_stream_recv_state prev_state;
 	
@@ -2625,10 +2658,10 @@ nvmf_quic_datagram_cb(void *arg, struct spdk_sock_group *group, struct spdk_sock
 	local.sin.sin_port = htons(4420);
 	local.sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-	SPDK_DEBUGLOG(nvmf,"Received UDP datagram on QUIC poll group %p\n", qgroup);
+	SPDK_DEBUGLOG(nvmf,"Received UDP datagram on QUIC poll group %p (reactor %u)\n", qgroup, spdk_env_get_current_core());
 
 	if(sock == NULL) {
-		SPDK_ERRLOG("Invalid socket in QUIC datagram callback\n");
+		SPDK_ERRLOG("Invalid socket in QUIC datagram callback on reactor %u\n", spdk_env_get_current_core());
 		return;
 	}
 
@@ -2636,7 +2669,7 @@ nvmf_quic_datagram_cb(void *arg, struct spdk_sock_group *group, struct spdk_sock
 	while(1) {
 		/* Receive packet and extract source address */
 		rc = nvme_quic_read_data_with_msghdr(sock, sizeof(buf), buf, &msg);
-		SPDK_DEBUGLOG(nvmf_quic,"nvme_quic_read_data_with_msghdr returned rc=%d\n", rc);
+		SPDK_DEBUGLOG(nvmf_quic,"nvme_quic_read_data_with_msghdr returned rc=%d on reactor %u\n", rc, spdk_env_get_current_core());
 		if (rc > 0) {
 			/* Log the client address we received from */
 			char remote_str[64];
@@ -2645,7 +2678,7 @@ nvmf_quic_datagram_cb(void *arg, struct spdk_sock_group *group, struct spdk_sock
 				inet_ntop(AF_INET, &remote.sin.sin_addr, remote_str, sizeof(remote_str));
 				remote_port = ntohs(remote.sin.sin_port);
 			}
-			SPDK_DEBUGLOG(nvmf_quic,"Received %d bytes from client %s:%u\n", rc, remote_str, remote_port);
+			SPDK_DEBUGLOG(nvmf_quic,"Received %d bytes from client %s:%u on reactor %u\n", rc, remote_str, remote_port, spdk_env_get_current_core());
 		}
 		if (rc <= 0)
 			break;
@@ -2656,58 +2689,19 @@ nvmf_quic_datagram_cb(void *arg, struct spdk_sock_group *group, struct spdk_sock
 		while(off != rc) {
 			quicly_decoded_packet_t packet;
 			if(quicly_decode_packet(ctx, &packet, buf, rc, &off) == SIZE_MAX) {
-				SPDK_ERRLOG("Failed to decode QUIC packet\n");
+				SPDK_ERRLOG("Failed to decode QUIC packet on reactor %u\n", spdk_env_get_current_core());
 				break;
 			}
 
 			if(QUICLY_PACKET_IS_LONG_HEADER(packet.octets.base[0])) {
-				const char *pkt_type_str = "UNKNOWN";
-				uint8_t pkt_type = packet.octets.base[0] & QUICLY_PACKET_TYPE_BITMASK;
-				if (QUICLY_PACKET_IS_INITIAL(packet.octets.base[0])) {
-					pkt_type_str = "INITIAL";
-				} else if (pkt_type == (QUICLY_PACKET_TYPE_HANDSHAKE & QUICLY_PACKET_TYPE_BITMASK)) {
-					pkt_type_str = "HANDSHAKE";
-				} else if (pkt_type == (QUICLY_PACKET_TYPE_0RTT & QUICLY_PACKET_TYPE_BITMASK)) {
-					pkt_type_str = "0-RTT";
-				} else if (pkt_type == (QUICLY_PACKET_TYPE_RETRY & QUICLY_PACKET_TYPE_BITMASK)) {
-					pkt_type_str = "RETRY";
-				}
-				// Print first 8 bytes of DCID and SCID
-				if (packet.cid.src.len > 0) {
-					SPDK_DEBUGLOG(nvmf,"Long header packet: type=%s (0x%02x), version=0x%x, "
-								"DCID=%02x%02x%02x%02x%02x%02x%02x%02x (len=%u), "
-								"SCID=%02x%02x%02x%02x%02x%02x%02x%02x (len=%u), off=%zu\n",
-								pkt_type_str, pkt_type, packet.version,
-								packet.cid.dest.encrypted.base[0], packet.cid.dest.encrypted.base[1],
-								packet.cid.dest.encrypted.base[2], packet.cid.dest.encrypted.base[3],
-								packet.cid.dest.encrypted.base[4], packet.cid.dest.encrypted.base[5],
-								packet.cid.dest.encrypted.base[6], packet.cid.dest.encrypted.base[7],
-								packet.cid.dest.encrypted.len,
-								packet.cid.src.base[0], packet.cid.src.base[1],
-								packet.cid.src.base[2], packet.cid.src.base[3],
-								packet.cid.src.base[4], packet.cid.src.base[5],
-								packet.cid.src.base[6], packet.cid.src.base[7],
-								packet.cid.src.len, off);
-				} else {
-					SPDK_DEBUGLOG(nvmf,"Long header packet: type=%s (0x%02x), version=0x%x, "
-								"DCID=%02x%02x%02x%02x%02x%02x%02x%02x (len=%u), "
-								"SCID_len=0, off=%zu\n",
-								pkt_type_str, pkt_type, packet.version,
-								packet.cid.dest.encrypted.base[0], packet.cid.dest.encrypted.base[1],
-								packet.cid.dest.encrypted.base[2], packet.cid.dest.encrypted.base[3],
-								packet.cid.dest.encrypted.base[4], packet.cid.dest.encrypted.base[5],
-								packet.cid.dest.encrypted.base[6], packet.cid.dest.encrypted.base[7],
-								packet.cid.dest.encrypted.len, off);
-				}
-				
 				if(packet.version != 0 && !quicly_is_supported_version(packet.version)) {
-					SPDK_DEBUGLOG(nvmf,"Received unsupported QUIC version: 0x%08x\n", packet.version);
+					SPDK_DEBUGLOG(nvmf,"Received unsupported QUIC version: 0x%08x on reactor %u\n", packet.version, spdk_env_get_current_core());
 					// just ignore unsupported version for now
 					break;
 				}
 
 				if(packet.cid.dest.encrypted.len > QUICLY_MAX_CID_LEN_V1 || packet.cid.src.len > QUICLY_MAX_CID_LEN_V1) {
-					SPDK_ERRLOG("Received QUIC packet with invalid CID length\n");
+					SPDK_ERRLOG("Received QUIC packet with invalid CID length on reactor %u\n", spdk_env_get_current_core());
 					break;
 				}
 			}
@@ -2715,19 +2709,36 @@ nvmf_quic_datagram_cb(void *arg, struct spdk_sock_group *group, struct spdk_sock
 			/* For vailed packet's process */
 			quicly_conn_t *conn = NULL;
 
+			/* CHECK eBPF ROUTING: Extract shard_id from DCID and verify it matches this poll group */
+			// if (packet.cid.dest.encrypted.len >= 1) {
+			// 	uint8_t dcid_byte0 = packet.cid.dest.encrypted.base[0];
+			// 	uint8_t dcid_shard_id = dcid_byte0;  /* Full byte (0-255) */
+			// 	uint8_t expected_thread_id = qgroup->next_cid.thread_id;
+			// 	const char *pkt_type_str = QUICLY_PACKET_IS_INITIAL(packet.octets.base[0]) ? "INITIAL" :
+			// 	                           QUICLY_PACKET_IS_LONG_HEADER(packet.octets.base[0]) ? "LONG_HEADER" : "SHORT_HEADER";
+				
+			// 	// SPDK_DEBUGLOG(nvmf, "*** eBPF ROUTING CHECK *** Packet type=%s, DCID byte0=0x%02x, shard_id=%u, "
+			// 	//                "this poll_group, MATCH=%s on reactor %u\n",
+			// 	//                pkt_type_str, dcid_byte0, dcid_shard_id, spdk_env_get_current_core());
+			// }
+
 			/* hash search like tcp's established hash table */
 			qqpair = nvmf_quic_find_qpair_by_decoded_cid(qgroup, &packet);
-			SPDK_DEBUGLOG(nvmf,"nvmf_quic_find_qpair_by_decoded_cid returned qqpair=%p\n", qqpair);
+			SPDK_DEBUGLOG(nvmf,"nvmf_quic_find_qpair_by_decoded_cid returned qqpair=%p on reactor %u\n", qqpair, spdk_env_get_current_core());
 			if(qqpair) {
 				conn = qqpair->conn;
-				quicly_receive(conn, &local, &remote, &packet);
-				newly_created_conn = conn; /* Update in case of multiple packets */
+				quicly_error_t recv_ret = quicly_receive(conn, &local, &remote, &packet);
+				if (recv_ret != 0) {
+					SPDK_ERRLOG("quicly_receive() failed for qpair %p: error code = %ld (0x%lx) on reactor %u\n",
+						    qqpair, recv_ret, recv_ret, spdk_env_get_current_core());
+					/* Continue to allow connection cleanup */
+				} else {
+					SPDK_DEBUGLOG(nvmf, "quicly_receive() succeeded for qpair %p on reactor %u\n", qqpair, spdk_env_get_current_core());
+				}
 				continue;
 			}
 			
-			if (QUICLY_PACKET_IS_LONG_HEADER(packet.octets.base[0]) && 
-			    QUICLY_PACKET_IS_INITIAL(packet.octets.base[0]) &&
-			    newly_created_conn == NULL) {
+			if (QUICLY_PACKET_IS_INITIAL(packet.octets.base[0])) {
 				/* New Connection request - INITIAL packet */
 				/* Token validation if it exists */
 				quicly_address_token_plaintext_t *token = NULL, token_buf;
@@ -2740,38 +2751,52 @@ nvmf_quic_datagram_cb(void *arg, struct spdk_sock_group *group, struct spdk_sock
 					if(ret == 0 && quicly_validate_token(&quicly_spec_context, &remote.sa, packet.cid.dest.encrypted, packet.cid.src, &token_buf, &err_desc)) {
 						token = &token_buf;
 					} else {
-						SPDK_DEBUGLOG(nvmf,"Invalid address token: %s\n", err_desc ? err_desc : "decryption failed");
+						SPDK_DEBUGLOG(nvmf,"Invalid address token: %s on reactor %u\n", err_desc ? err_desc : "decryption failed", spdk_env_get_current_core());
 					}
 					
 				}
 
 				/* Debug: verify context state before quicly_accept */
-				SPDK_DEBUGLOG(nvmf,"Before quicly_accept: quic_ctx=%p, tls=%p, cipher_suites=%p\n",
+				SPDK_DEBUGLOG(nvmf,"Before quicly_accept: quic_ctx=%p, tls=%p, cipher_suites=%p on reactor %u\n",
 					       qtransport->quic_ctx, qtransport->quic_ctx ? qtransport->quic_ctx->tls : NULL,
-					       qtransport->quic_ctx && qtransport->quic_ctx->tls ? qtransport->quic_ctx->tls->cipher_suites : NULL);
+					       qtransport->quic_ctx && qtransport->quic_ctx->tls ? qtransport->quic_ctx->tls->cipher_suites : NULL, spdk_env_get_current_core());
 				if (qtransport->quic_ctx && qtransport->quic_ctx->tls && qtransport->quic_ctx->tls->cipher_suites) {
-					SPDK_DEBUGLOG(nvmf,"  cipher_suites[0]=%p\n", qtransport->quic_ctx->tls->cipher_suites[0]);
+					SPDK_DEBUGLOG(nvmf,"  cipher_suites[0]=%p on reactor %u\n", qtransport->quic_ctx->tls->cipher_suites[0], spdk_env_get_current_core());
 				}
 				if (qtransport->quic_ctx && qtransport->quic_ctx->tls) {
-					SPDK_DEBUGLOG(nvmf,"  PSK identity=%.*s, secret_len=%zu\n",
+					SPDK_DEBUGLOG(nvmf,"  PSK identity=%.*s, secret_len=%zu on reactor %u\n",
 						       (int)qtransport->quic_ctx->tls->pre_shared_key.identity.len,
 						       qtransport->quic_ctx->tls->pre_shared_key.identity.base,
-						       qtransport->quic_ctx->tls->pre_shared_key.secret.len);
+						       qtransport->quic_ctx->tls->pre_shared_key.secret.len, spdk_env_get_current_core());
 				}
 
-				/* accept new connection using qpair's context */
-				SPDK_DEBUGLOG(nvmf,"About to call quicly_accept with next_cid: master_id=%lu, path_id=%lu, thread_id=%u\n",
-					       qtransport->next_cid.master_id, qtransport->next_cid.path_id, qtransport->next_cid.thread_id);
-				SPDK_DEBUGLOG(nvmf,"  cid_encryptor=%p\n", qtransport->quic_ctx->cid_encryptor);
+				/* Extract shard_id from client's CID and use it for server's CID
+				 * This ensures eBPF routes packets for the same connection to the same socket */
+				uint8_t client_shard_id = 0;
+				if (packet.cid.src.len >= 1 && packet.cid.src.base != NULL) {
+					client_shard_id = packet.cid.src.base[0];  /* Full byte (0-255) */
+					SPDK_DEBUGLOG(nvmf, "Client INITIAL packet has SCID shard_id=%u, poll_group has thread_id=%u on reactor %u\n",
+						      client_shard_id, qgroup->next_cid.thread_id, spdk_env_get_current_core());
+				}
+				
+				/* Use client's shard_id as server's thread_id for consistent routing.
+				 * Server's CIDs will use this shard_id, ensuring eBPF routes subsequent 
+				 * packets back to THIS poll group. */
+				qgroup->next_cid.thread_id = client_shard_id;
+				SPDK_DEBUGLOG(nvmf, "Server will create CIDs with shard_id=%u (from client's INITIAL SCID) for consistent eBPF routing\n",
+					       qgroup->next_cid.thread_id);
+				
 				quicly_error_t ret = quicly_accept(&conn, qtransport->quic_ctx, &local.sa, &remote.sa,
-								  &packet, token, &qtransport->next_cid, NULL, NULL);
+								  &packet, token, &qgroup->next_cid, NULL, NULL);
 				if(ret == 0) {
-					SPDK_DEBUGLOG(nvmf,"Accepted new QUIC connection: conn=%p\n", conn);			
+					SPDK_DEBUGLOG(nvmf,"Accepted new QUIC connection: conn=%p on reactor %u\n", conn, spdk_env_get_current_core());	
 					
+					newly_created_conn = conn; /* Update in case of multiple packets */
+
 					/* Create new qpair first with its own contexts */
 					qqpair = nvmf_quic_qpair_create(qgroup, conn);
 					if(qqpair == NULL) {
-						SPDK_ERRLOG("Failed to create QUIC qpair for new connection\n");
+						SPDK_ERRLOG("Failed to create QUIC qpair for new connection on reactor %u\n", spdk_env_get_current_core());
 						continue;  /* Try next packet */
 					}
 
@@ -2800,63 +2825,12 @@ nvmf_quic_datagram_cb(void *arg, struct spdk_sock_group *group, struct spdk_sock
 
 					*quicly_get_data(conn) = qqpair;
 					
-					/* Check CID immediately after accept - print all CIDs */
-					struct _st_quicly_conn_public_t *conn_pub_dbg = (struct _st_quicly_conn_public_t *)conn;
-					SPDK_DEBUGLOG(nvmf,"After quicly_accept - CID information:\n");
-					SPDK_DEBUGLOG(nvmf,"  original_dcid.len=%u\n", conn_pub_dbg->original_dcid.len);
-					if (conn_pub_dbg->original_dcid.len > 0) {
-						SPDK_DEBUGLOG(nvmf,"  original_dcid.cid=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-							       conn_pub_dbg->original_dcid.cid[0], conn_pub_dbg->original_dcid.cid[1],
-							       conn_pub_dbg->original_dcid.cid[2], conn_pub_dbg->original_dcid.cid[3],
-							       conn_pub_dbg->original_dcid.cid[4], conn_pub_dbg->original_dcid.cid[5],
-							       conn_pub_dbg->original_dcid.cid[6], conn_pub_dbg->original_dcid.cid[7]);
-					}
-					
-					SPDK_DEBUGLOG(nvmf,"  local.cid_set._size=%zu\n", conn_pub_dbg->local.cid_set._size);
-					if (conn_pub_dbg->local.cid_set._size > 0) {
-						SPDK_DEBUGLOG(nvmf,"  local.cid_set.cids[0].cid.len=%u\n",
-							       conn_pub_dbg->local.cid_set.cids[0].cid.len);
-						if (conn_pub_dbg->local.cid_set.cids[0].cid.len > 0) {
-							SPDK_DEBUGLOG(nvmf,"  local.cid_set.cids[0].cid=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-								       conn_pub_dbg->local.cid_set.cids[0].cid.cid[0],
-								       conn_pub_dbg->local.cid_set.cids[0].cid.cid[1],
-								       conn_pub_dbg->local.cid_set.cids[0].cid.cid[2],
-								       conn_pub_dbg->local.cid_set.cids[0].cid.cid[3],
-								       conn_pub_dbg->local.cid_set.cids[0].cid.cid[4],
-								       conn_pub_dbg->local.cid_set.cids[0].cid.cid[5],
-								       conn_pub_dbg->local.cid_set.cids[0].cid.cid[6],
-								       conn_pub_dbg->local.cid_set.cids[0].cid.cid[7]);
-						}
-					}
-					
-					SPDK_DEBUGLOG(nvmf,"  local.long_header_src_cid.len=%u\n", conn_pub_dbg->local.long_header_src_cid.len);
-					if (conn_pub_dbg->local.long_header_src_cid.len > 0) {
-						SPDK_DEBUGLOG(nvmf,"  local.long_header_src_cid=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-							       conn_pub_dbg->local.long_header_src_cid.cid[0],
-							       conn_pub_dbg->local.long_header_src_cid.cid[1],
-							       conn_pub_dbg->local.long_header_src_cid.cid[2],
-							       conn_pub_dbg->local.long_header_src_cid.cid[3],
-							       conn_pub_dbg->local.long_header_src_cid.cid[4],
-							       conn_pub_dbg->local.long_header_src_cid.cid[5],
-							       conn_pub_dbg->local.long_header_src_cid.cid[6],
-							       conn_pub_dbg->local.long_header_src_cid.cid[7]);
-					}
+					++qgroup->next_cid.master_id;  /* Increment poll group's CID counter */
 
-					nvmf_quic_add_qpair_to_hash(qgroup, qqpair, conn);
-					/* Don't add to hash yet - CID not set up until after first packet is processed */
-					++qtransport->next_cid.master_id;
-					
-					/* Add qpair to poll group's list so it can be flushed */
-					/* Check if already in a group to prevent double-insertion */
-					if (qqpair->group != NULL) {
-						SPDK_ERRLOG("WARNING: qpair %p already has group %p, not adding again!\n", 
-						           qqpair, qqpair->group);
-					} else {
-						qqpair->group = qgroup;
-						TAILQ_INSERT_TAIL(&qgroup->qpairs, qqpair, link);
-						SPDK_DEBUGLOG(nvmf,"Added qpair %p to poll group qpairs list\n", qqpair);
-						nvmf_quic_qpair_set_state(qqpair, NVMF_QUIC_QPAIR_STATE_RUNNING);
+					if (!qqpair->in_hash_table && qqpair->group) {
+						nvmf_quic_add_qpair_to_hash(qqpair->group, qqpair, qqpair->conn);
 					}
+					
 				} else {
 					SPDK_ERRLOG("quicly_accept failed: %d (0x%x)\n", ret, ret);
 					/* Clean up qpair if accept failed - transport contexts are shared, don't free them */
@@ -2864,26 +2838,22 @@ nvmf_quic_datagram_cb(void *arg, struct spdk_sock_group *group, struct spdk_sock
 				}
 			} else if (newly_created_conn != NULL) {
 				/* Coalesced packet (0-RTT, HANDSHAKE, etc.) belonging to newly created connection */
-				SPDK_DEBUGLOG(nvmf,"Processing coalesced packet with newly_created_conn=%p\n", newly_created_conn);
+				SPDK_DEBUGLOG(nvmf,"Processing coalesced packet with newly_created_conn=%p on reactor %u\n", newly_created_conn, spdk_env_get_current_core());
 				quicly_error_t recv_ret = quicly_receive(newly_created_conn, &remote, &local, &packet);
 				if (recv_ret != 0) {
-					SPDK_ERRLOG("Failed to process coalesced packet: %d (0x%x)\n", recv_ret, recv_ret);
+					SPDK_ERRLOG("Failed to process coalesced packet: %d (0x%x) on reactor %u\n", recv_ret, recv_ret, spdk_env_get_current_core());
 				}
 			} else {
 				/* Non-INITIAL packet without existing connection - this shouldn't happen */
-				SPDK_ERRLOG("Received non-INITIAL packet without existing connection, ignoring\n");
+				SPDK_ERRLOG("Received non-INITIAL packet without existing connection on reactor %u, ignoring\n", spdk_env_get_current_core());
 			}
 		}
-		
-		/* The CID is not populated yet at this point. It will be populated after
-		 * quicly_send() is called during the flush operation. The qpair will be
-		 * added to the hash table in _nvmf_quic_send_pending(). */
 	}
 
 
 	/* Flush every connection */
-	SPDK_DEBUGLOG(nvmf,"Flushing QUIC poll group %p\n", qgroup);
-	SPDK_DEBUGLOG(nvmf,"About to call nvmf_quic_poll_group_flush\n");
+	SPDK_DEBUGLOG(nvmf,"Flushing QUIC poll group %p on reactor %u\n", qgroup, spdk_env_get_current_core());
+	SPDK_DEBUGLOG(nvmf,"About to call nvmf_quic_poll_group_flush on reactor %u\n", spdk_env_get_current_core());
 	nvmf_quic_poll_group_flush(qgroup);
 	SPDK_DEBUGLOG(nvmf_quic, "Returned from nvmf_quic_poll_group_flush\n");
 
@@ -3440,19 +3410,14 @@ nvmf_quic_create(struct spdk_nvmf_transport_opts *opts)
 	qtransport->stream_scheduler.do_send = scheduler_do_send;
 	qtransport->quic_ctx->stream_scheduler = &qtransport->stream_scheduler;
 	
-	/* Setup CID encryptor with a random key */
-	{
-		static char cid_key[17];
-		ptls_openssl_random_bytes(cid_key, sizeof(cid_key) - 1);
-		size_t key_len = sizeof(cid_key) - 1;  /* Use actual buffer size, not strlen on random bytes! */
-		SPDK_DEBUGLOG(nvmf,"CID key generated: actual_len=%zu, strlen=%zu, first_bytes=%02x%02x%02x%02x\n",
-			       key_len, strlen(cid_key), (uint8_t)cid_key[0], (uint8_t)cid_key[1], 
-			       (uint8_t)cid_key[2], (uint8_t)cid_key[3]);
-		qtransport->quic_ctx->cid_encryptor = quicly_new_default_cid_encryptor(
-			&ptls_openssl_quiclb, &ptls_openssl_aes128ecb, &ptls_openssl_sha256,
-			ptls_iovec_init(cid_key, key_len));
-		SPDK_DEBUGLOG(nvmf,"CID encryptor created: %p\n", qtransport->quic_ctx->cid_encryptor);
+	/* Setup CID encryptor - use hybrid (plaintext byte 0 for eBPF routing) */
+	qtransport->quic_ctx->cid_encryptor = nvme_quic_new_plaintext_cid_encryptor();
+	if (qtransport->quic_ctx->cid_encryptor == NULL) {
+		SPDK_ERRLOG("Failed to create hybrid CID encryptor\n");
+		return -ENOMEM;
 	}
+	SPDK_DEBUGLOG(nvmf, "Hybrid CID encryptor created: %p (16-byte CIDs with plaintext shard_id in byte 0)\n",
+		      qtransport->quic_ctx->cid_encryptor);
 
 	/* Setup address token encryption for Retry/Resumption tokens (shared across all connections) */
 	{
@@ -3462,10 +3427,17 @@ nvmf_quic_create(struct spdk_nvmf_transport_opts *opts)
 		qtransport->address_token_aead.dec = ptls_aead_new(&ptls_openssl_aes128gcm, &ptls_openssl_sha256, 0, secret, "");
 	}
 
-	/* Initialize next CID */
+	/* Initialize next CID (legacy - now using per-poll-group CIDs) */
 	qtransport->next_cid.master_id = 0;
 	qtransport->next_cid.path_id = 0;
 	qtransport->next_cid.thread_id = 0;
+
+	/* Initialize thread_id counter for poll groups (for eBPF routing) */
+	qtransport->next_thread_id = 0;
+
+
+
+
 
 	return &qtransport->transport;
 }
@@ -3527,6 +3499,20 @@ nvmf_quic_destroy(struct spdk_nvmf_transport *transport,
 	spdk_poller_unregister(&qtransport->accept_poller);
 	spdk_sock_group_unregister_interrupt(qtransport->listen_sock_group);
 	spdk_sock_group_close(&qtransport->listen_sock_group);
+
+	/* Free plaintext CID encryptor */
+	if (qtransport->quic_ctx && qtransport->quic_ctx->cid_encryptor) {
+		nvme_quic_free_plaintext_cid_encryptor(qtransport->quic_ctx->cid_encryptor);
+	}
+
+	/* Free address token AEAD */
+	if (qtransport->address_token_aead.enc) {
+		ptls_aead_free(qtransport->address_token_aead.enc);
+	}
+	if (qtransport->address_token_aead.dec) {
+		ptls_aead_free(qtransport->address_token_aead.dec);
+	}
+
 	free(qtransport);
 
 	if (cb_fn) {
@@ -3892,6 +3878,16 @@ nvmf_quic_poll_group_create(struct spdk_nvmf_transport *transport, struct spdk_n
 		goto cleanup;
 	}
 
+	/* Initialize per-poll-group CID generator with unique thread_id
+	 * This enables eBPF to route packets back to correct socket */
+	qgroup->next_cid.master_id = 0;
+	qgroup->next_cid.path_id = 0;
+	qgroup->next_cid.thread_id = 0;  /* Assign unique ID: 0, 1, 2, 3... */
+	qgroup->next_cid.node_id = 0;
+	
+	SPDK_DEBUGLOG(nvmf, "Poll group created with thread_id=%u for eBPF routing\n", 
+		       qgroup->next_cid.thread_id);
+
 	TAILQ_INSERT_TAIL(&qtransport->poll_groups, qgroup, link);
 	if(qtransport->next_pg == NULL) {
 		qtransport->next_pg = qgroup;
@@ -3933,6 +3929,13 @@ nvmf_quic_get_optimal_poll_group(struct spdk_nvmf_qpair *qpair)
 	hint = (*pg)->sock_group;
 
 	qqpair = SPDK_CONTAINEROF(qpair, struct spdk_nvmf_quic_qpair, qpair);
+
+	
+	// For QUIC, we can directly return the poll group that the qpair is already associated with, as the optimal poll group is determined by the connection's CID and doesn't change over the connection's lifetime.  This also avoids the overhead of calling spdk_sock_group_get_optimal_sock_group for every request.
+
+	return qqpair->group;
+
+
 	/* TODO: spdk_sock_group_get_optimal_sock_group may not exist */
 	group = NULL;
 	rc = -1; /* spdk_sock_group_get_optimal_sock_group(qqpair->sock, &group, hint); */
