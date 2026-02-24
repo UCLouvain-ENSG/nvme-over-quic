@@ -98,6 +98,12 @@ struct nvme_quic_poll_group {
 
 	TAILQ_HEAD(, nvme_quic_qpair) needs_poll;
 	TAILQ_HEAD(, nvme_quic_qpair) timeout_enabled;
+
+	/* QUIC stats tracking for debugging latency spikes */
+	uint64_t stats_poll_counter;
+	uint64_t stats_last_ptos;
+	uint64_t stats_last_lost;
+	uint64_t stats_last_resent;
 	struct spdk_nvme_quic_stat stats;
 };
 
@@ -141,6 +147,7 @@ struct nvme_quic_qpair {
 
 	uint16_t				num_entries;
 	uint16_t				async_complete;
+	uint16_t				async_stream_complete;
 
 	enum nvme_quic_qpair_state		state;
 
@@ -276,6 +283,7 @@ nvme_quic_req_get(struct nvme_quic_qpair *qqpair)
 
     quic_req = TAILQ_FIRST(&qqpair->free_reqs);
     if (!quic_req) {
+		NVME_QQPAIR_DEBUGLOG(qqpair, "[REQ_GET] No free requests available for qqpair %p\n", qqpair);
         return NULL;
     }
 
@@ -335,10 +343,19 @@ nvme_quic_req_put(struct nvme_quic_qpair *qqpair, struct nvme_quic_req *quic_req
 		}
 	}
 	
-	quic_req->state = NVME_QUIC_REQ_FREE;
-	//TAILQ_INSERT_HEAD(&qqpair->free_reqs, quic_req, link);
-	TAILQ_INSERT_TAIL(&qqpair->free_reqs, quic_req, link);
+	ptls_buffer_dispose(&quic_req->stream->streambuf.ingress);
+	ptls_buffer_init(&quic_req->stream->streambuf.ingress, "", 0);
 
+	quicly_sendbuf_dispose(&quic_req->stream->streambuf.egress);
+	quicly_sendbuf_init(&quic_req->stream->streambuf.egress);
+
+
+	quic_req->state = NVME_QUIC_REQ_FREE;
+	// TAILQ_INSERT_HEAD(&qqpair->free_reqs, quic_req, link);
+
+	qqpair->async_stream_complete++;
+
+	TAILQ_INSERT_TAIL(&qqpair->free_reqs, quic_req, link);
 }
 
 static void
@@ -346,6 +363,9 @@ nvme_quic_free_reqs(struct nvme_quic_qpair *qqpair)
 {
 	free(qqpair->quic_reqs);
 	qqpair->quic_reqs = NULL;
+
+	spdk_free(qqpair->send_streams);
+	qqpair->send_streams = NULL;
 }
 
 static int
@@ -353,16 +373,23 @@ nvme_quic_alloc_reqs(struct nvme_quic_qpair *qqpair)
 {
 	uint16_t i;
 	struct nvme_quic_req *quic_req;
+	uint16_t padded_qsize = qqpair->num_entries;  /* Convert back to actual qsize for allocation */
+	// uint16_t padded_qsize = 1024;
+
+	NVME_QQPAIR_DEBUGLOG(qqpair, "[ALLOC_REQS] Starting allocation: num_entries=%u, padded_qsize=%u (qsize)\n",
+			    qqpair->num_entries, padded_qsize);
 
 	qqpair->quic_reqs = aligned_alloc(SPDK_CACHE_LINE_SIZE,
-					 qqpair->num_entries * sizeof(*quic_req));
+					 padded_qsize * sizeof(*quic_req));
 	if (qqpair->quic_reqs == NULL) {
 		NVME_QQPAIR_ERRLOG(qqpair, "Failed to allocate quic_reqs\n");
 		goto fail;
 	}
+	NVME_QQPAIR_DEBUGLOG(qqpair, "[ALLOC_REQS] Allocated quic_reqs array at %p (size=%zu bytes)\n",
+			    qqpair->quic_reqs, padded_qsize * sizeof(*quic_req));
 
 	/* Add additional 2 member for the send_stream, recv_stream owned by the qqpair */
-	qqpair->send_streams = spdk_zmalloc((qqpair->num_entries + 2) * sizeof(struct nvme_quic_stream),
+	qqpair->send_streams = spdk_zmalloc((padded_qsize + 2) * sizeof(struct nvme_quic_stream),
 					 0x1000, NULL,
 					 SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
 
@@ -371,11 +398,11 @@ nvme_quic_alloc_reqs(struct nvme_quic_qpair *qqpair)
 		goto fail;
 	}
 
-	memset(qqpair->quic_reqs, 0, qqpair->num_entries * sizeof(*quic_req));
+	memset(qqpair->quic_reqs, 0, padded_qsize * sizeof(*quic_req));
 	TAILQ_INIT(&qqpair->free_reqs);
 	TAILQ_INIT(&qqpair->outstanding_reqs);
 	qqpair->qpair.queue_depth = 0;
-	for (i = 0; i < qqpair->num_entries; i++) {
+	for (i = 0; i < padded_qsize; i++) {
 		quic_req = &qqpair->quic_reqs[i];
 		quic_req->cid = i;
 		quic_req->qqpair = qqpair;
@@ -386,10 +413,11 @@ nvme_quic_alloc_reqs(struct nvme_quic_qpair *qqpair)
 		quicly_sendbuf_init(&quic_req->stream->streambuf.egress);
 		ptls_buffer_init(&quic_req->stream->streambuf.ingress, "", 0);
 
-		NVME_QQPAIR_DEBUGLOG(qqpair, "streambuf init check egress %p ingress %p\n",
-			    &quic_req->stream->streambuf.egress,
-			    &quic_req->stream->streambuf.ingress);
-
+		if (i < 5 || i >= padded_qsize - 5) {
+			/* Log first 5 and last 5 requests */
+			NVME_QQPAIR_DEBUGLOG(qqpair, "[ALLOC_REQS]   req[%u]: cid=%u, quic_req=%p, stream=%p\n",
+					    i, quic_req->cid, quic_req, quic_req->stream);
+		}
 
 		TAILQ_INSERT_TAIL(&qqpair->free_reqs, quic_req, link);
 	}
@@ -470,6 +498,12 @@ nvme_quic_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 	if (!qqpair->shared_stats) {
 		free(qqpair->stats);
 	}
+
+	if (qqpair->conn) {
+		quicly_free(qqpair->conn);
+		qqpair->conn = NULL;
+	}
+
 	free(qqpair);
 
 	return 0;
@@ -512,12 +546,26 @@ nvme_quic_ctrlr_destruct(struct spdk_nvme_ctrlr *ctrlr)
 	return 0;
 }
 
+static bool
+nvme_quic_has_pending_data(struct nvme_quic_qpair *qqpair)
+{
+	int64_t now, first_timeout;
+
+	if (!qqpair->conn) {
+		return false;
+	}
+
+	now = spdk_get_ticks();
+	first_timeout = quicly_get_first_timeout(qqpair->conn);
+	/* If first_timeout is in the past or now, there's pending data (including ACKs, retransmissions, etc.) */
+	return (first_timeout != INT64_MAX && first_timeout <= now);
+}
+
 static void
 
 nvme_quic_cond_schedule_qpair_polling(struct nvme_quic_qpair *qqpair)
 {
 	struct nvme_quic_poll_group *pgroup;
-	int64_t now, first_timeout;
 	bool has_pending_data = false;
 
 	if (TAILQ_ENTRY_ENQUEUED(qqpair, link_poll) || !qqpair->qpair.poll_group) {
@@ -526,14 +574,9 @@ nvme_quic_cond_schedule_qpair_polling(struct nvme_quic_qpair *qqpair)
 	}
 
 	/* Check if QUIC has pending data to send */
-	if (qqpair->conn) {
-		now = spdk_get_ticks();
-		first_timeout = quicly_get_first_timeout(qqpair->conn);
-		if (first_timeout != INT64_MAX && first_timeout <= now) {
-			has_pending_data = true;
-			NVME_QQPAIR_DEBUGLOG(qqpair, "[NEEDS_POLL] QUIC has pending data (timeout=%ld, now=%ld)\n",
-					     first_timeout, now);
-		}
+	has_pending_data = nvme_quic_has_pending_data(qqpair);
+	if (has_pending_data) {
+		NVME_QQPAIR_DEBUGLOG(qqpair, "[NEEDS_POLL] QUIC has pending data\n");
 	}
 
 	/* Skip only if: (1) no queued requests AND (2) no pending QUIC data AND (3) not in special states */
@@ -575,6 +618,7 @@ stream_write_fail(struct nvme_quic_stream *stream, int status)
 	stream_write_done(stream, status);
 }
 
+
 static void
 _quic_send_pending(struct nvme_quic_qpair *qqpair)
 {
@@ -583,36 +627,66 @@ _quic_send_pending(struct nvme_quic_qpair *qqpair)
 	struct iovec udp_datagrams[SPDK_NVME_ADMIN_QUEUE_QUIRK_ENTRIES_MULTIPLE];
 	uint8_t buf[SPDK_NVME_ADMIN_QUEUE_QUIRK_ENTRIES_MULTIPLE * SPDK_NVME_QUIC_MAX_UDP_DATAGRAM_SIZE];
 	quicly_error_t ret;
-	
-	num_packets = SPDK_NVME_ADMIN_QUEUE_QUIRK_ENTRIES_MULTIPLE;
+	int total_packets_sent = 0;
 
-	/* Ask quicly to generate UDP packets from queued stream data */
-	// NVME_QQPAIR_ERRLOG(qqpair, "[DEBUG] About to call quicly_send, max_packets=%zu\n", max_packets);
-	ret = quicly_send(qqpair->conn, &dest, &src, udp_datagrams, &num_packets, buf, sizeof(buf));
-	if (ret != 0) {
-		// NVME_QQPAIR_ERRLOG(qqpair, "quicly_send failed with error code %d\n", ret);
-		return;
-	}
+	/* Keep calling quicly_send() until all pending data is sent */
+	do {
+		num_packets = SPDK_NVME_ADMIN_QUEUE_QUIRK_ENTRIES_MULTIPLE;
 
-	// NVME_QQPAIR_ERRLOG(qqpair, "[DEBUG] quicly_send returned %zu packets\n", num_packets);
-	if (num_packets == 0) {
-		/* Nothing to send */
-		NVME_QQPAIR_DEBUGLOG(qqpair, "_quic_send_pending: No packets to send (quicly_send returned 0)\n");
-		return;
-	}
+		/* Ask quicly to generate UDP packets from queued stream data */
+		ret = quicly_send(qqpair->conn, &dest, &src, udp_datagrams, &num_packets, buf, sizeof(buf));
+		if (ret != 0) {
+			SPDK_ERRLOG("quicly_send failed: %d\n", ret);
+			return total_packets_sent;
+		}
 
-	/* Send the generated UDP packets */
-	NVME_QQPAIR_DEBUGLOG(qqpair, "Sending %zu QUIC UDP datagrams\n", num_packets);
-	for(int i=0; i<num_packets; i++) {
-		NVME_QQPAIR_DEBUGLOG(qqpair, "  Datagram %d: len=%zu\n", i, udp_datagrams[i].iov_len);
-		ret = spdk_sock_writev(qqpair->sock, &udp_datagrams[i], 1);
-		if(ret < 0) {
-			NVME_QQPAIR_ERRLOG(qqpair, "spdk_sock_writev failed with errno %d\n", errno);
+		if (num_packets == 0) {
+			/* No more packets to send */
+			SPDK_DEBUGLOG(nvme, "Nothing to send PAKCET : quicly_send returned %zu packets\n", 
+						num_packets);
 			break;
 		}
+
+		SPDK_DEBUGLOG(nvme, "Send PAKCET : quicly_send returned %zu packets\n", 
+		            num_packets);
+
+		/* Log destination address */
+		{
+			char dest_str[64] = "N/A";
+			uint16_t dest_port = 0;
+			if (dest.sa.sa_family == AF_INET) {
+				struct sockaddr_in *d = (struct sockaddr_in *)&dest.sa;
+				inet_ntop(AF_INET, &d->sin_addr, dest_str, sizeof(dest_str));
+				dest_port = ntohs(d->sin_port);
+			} else if (dest.sa.sa_family == AF_INET6) {
+				struct sockaddr_in6 *d = (struct sockaddr_in6 *)&dest.sa;
+				inet_ntop(AF_INET6, &d->sin6_addr, dest_str, sizeof(dest_str));
+				dest_port = ntohs(d->sin6_port);
+			} else {
+				SPDK_ERRLOG("dest.sa.sa_family=%d (not AF_INET or AF_INET6!)\n", dest.sa.sa_family);
+			}
+
+		}
+		
+		/* Send all packets from this batch */
+		for(int i = 0; i < num_packets; i++) {
+			int rc = spdk_sock_writev_direct(qqpair->sock, &udp_datagrams[i], 1, &dest.sa, quicly_get_socklen(&dest.sa));
+			if (rc < 0) {
+				SPDK_DEBUGLOG(nvme, "spdk_sock_writev_direct failed: rc=%d, errno=%d (%s)\n", rc, errno, strerror(errno));
+			}
+		}
+		total_packets_sent += num_packets;
+	} while (num_packets > 0);
+
+	if (total_packets_sent > 0) {
+		SPDK_DEBUGLOG(nvme, "SERVER: _nvmf_quic_send_pending: sent total %d packets\n", 
+		            total_packets_sent);
 	}
-	
+
+	return total_packets_sent;
 }
+
+
 
 // static void
 // nvme_quic_qpair_write_stream(struct nvme_quic_qpair *qqpair,
@@ -1179,10 +1253,6 @@ nvme_quic_qpair_capsule_cmd_send(struct nvme_quic_qpair *qqpair,
 	NVME_QQPAIR_DEBUGLOG(qqpair, "[CMD_SEND_SETUP] Offset check: streambuf is at offset %zu in nvme_quic_stream\n",
 		    offsetof(struct nvme_quic_stream, streambuf));
 
-	/* Update quic_req->cid to match the actual cmd.cid that will be sent.
-	 * The cmd.cid may have been set by upper layers and differs from the
-	 * initial index-based cid assigned during request allocation. */
-	quic_req->cid = quic_req->req->cmd.cid;
 
 	/* Send NVMe-oF capsule command using write_vec with callback */
 	/* Setup element structure for consistent callback access */
@@ -1267,7 +1337,8 @@ end:
 	 * Don't override it here! */
 	
 	
-	if(quic_req->req->cmd.cid != SPDK_NVME_OPC_WRITE) {
+	/* BUG FIX: Check opcode (cmd.opc) not command ID (cmd.cid)! */
+	if(quic_req->req->cmd.opc != SPDK_NVME_OPC_WRITE) {
 		quicly_streambuf_egress_shutdown(nvme_stream->quic_stream);
 	}
 	
@@ -1283,6 +1354,9 @@ nvme_quic_qpair_submit_request(struct spdk_nvme_qpair *qpair,
 {
 	struct nvme_quic_qpair *qqpair;
 	struct nvme_quic_req *quic_req;
+
+	SPDK_DEBUGLOG(nvme, "[NEW_REQ_FROM_APP] enter: req opc=0x%02x\n",
+			req->cmd.opc);
 
 	qqpair = nvme_quic_qpair(qpair);
 	assert(qqpair != NULL);
@@ -1590,7 +1664,8 @@ nvme_quic_read_datagram(struct nvme_quic_qpair *qqpair) {
 	struct spdk_udp_sock *udp_sock = (struct spdk_udp_sock *)sock;
 	struct nvme_quic_ctrlr *qctrlr = nvme_quic_ctrlr(qqpair->qpair.ctrlr);
 	struct nvme_quic_poll_group *qgroup = nvme_quic_poll_group(qqpair->qpair.poll_group);
-	quicly_address_t dest, src;
+
+
 	struct msghdr msg = {0};
 	struct sockaddr_storage incoming_pkt_src;
 	msg.msg_name = &incoming_pkt_src;
@@ -1619,43 +1694,51 @@ nvme_quic_read_datagram(struct nvme_quic_qpair *qqpair) {
 		}
 		read_count++;
 		
+		/* Get local address ONCE per recvmsg (not per packet in the batch)
+		 * This is a huge improvement over calling getsockname for every packet */
+		struct sockaddr_storage local_sockaddr;
+		socklen_t local_len = sizeof(local_sockaddr);
+		struct sockaddr *src_addr = NULL;
+		
+		/* Use spdk_sock_getaddr to get local address - cache for this batch */
+		char local_str[64];
+		uint16_t local_port;
+		if (spdk_sock_getaddr(sock, local_str, sizeof(local_str), &local_port, NULL, 0, NULL) == 0) {
+			/* Convert back to sockaddr for quicly */
+			if (strchr(local_str, ':')) {
+				/* IPv6 */
+				struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&local_sockaddr;
+				s6->sin6_family = AF_INET6;
+				s6->sin6_port = htons(local_port);
+				inet_pton(AF_INET6, local_str, &s6->sin6_addr);
+				local_len = sizeof(struct sockaddr_in6);
+			} else {
+				/* IPv4 */
+				struct sockaddr_in *s4 = (struct sockaddr_in *)&local_sockaddr;
+				s4->sin_family = AF_INET;
+				s4->sin_port = htons(local_port);
+				inet_pton(AF_INET, local_str, &s4->sin_addr);
+				local_len = sizeof(struct sockaddr_in);
+			}
+			src_addr = (struct sockaddr *)&local_sockaddr;
+		}
+		
 		size_t off = 0;
 		while(off != rc) {
 			quicly_decoded_packet_t decoded;
-			char saddr[INET6_ADDRSTRLEN], caddr[INET6_ADDRSTRLEN];
-			uint16_t sport, cport;
 			
 			if(quicly_decode_packet(&qctrlr->quic_ctx, &decoded, recv_buf, rc, &off) == SIZE_MAX) {
 				// decode error, drop the rest data
 				break;
 			}
 			
-			/* Get both local and remote addresses using spdk_sock_getaddr */
-			if (spdk_sock_getaddr(sock, saddr, sizeof(saddr), &sport, caddr, sizeof(caddr), &cport) != 0) {
-				break;
-			}
+			/* Use incoming packet source address directly (already in msg.msg_name from recvmsg) */
+			struct sockaddr *dest_addr = (struct sockaddr *)&incoming_pkt_src;
 			
-			/* Populate sockaddr structures based on address family */
-			if (strchr(saddr, ':')) {
-				/* IPv6 */
-				struct sockaddr_in6 *src6 = (struct sockaddr_in6 *)&src.sa;
-				struct sockaddr_in6 *dest6 = (struct sockaddr_in6 *)&dest.sa;
-				src6->sin6_family = AF_INET6;
-				src6->sin6_port = htons(sport);
-				inet_pton(AF_INET6, saddr, &src6->sin6_addr);
-				dest6->sin6_family = AF_INET6;
-				dest6->sin6_port = htons(cport);
-				inet_pton(AF_INET6, caddr, &dest6->sin6_addr);
-			} else {
-				/* IPv4 */
-				struct sockaddr_in *src4 = (struct sockaddr_in *)&src.sa;
-				struct sockaddr_in *dest4 = (struct sockaddr_in *)&dest.sa;
-				src4->sin_family = AF_INET;
-				src4->sin_port = htons(sport);
-				inet_pton(AF_INET, saddr, &src4->sin_addr);
-				dest4->sin_family = AF_INET;
-				dest4->sin_port = htons(cport);
-				inet_pton(AF_INET, caddr, &dest4->sin_addr);
+			/* Check if we have valid addresses */
+			if (src_addr == NULL) {
+				/* Shouldn't happen */
+				break;
 			}
 			
 			uint8_t first_byte = decoded.octets.base[0];
@@ -1669,45 +1752,10 @@ nvme_quic_read_datagram(struct nvme_quic_qpair *qqpair) {
 				pkt_type = "1-RTT";
 			}
 			
-			/* Log addresses being passed to quicly_receive */
-			char recv_src_str[64], recv_dest_str[64];
-			char expected_src_str[64] = "N/A";
-			uint16_t recv_src_port = 0, recv_dest_port = 0;
-			
-			if (src.sa.sa_family == AF_INET) {
-				struct sockaddr_in *s = (struct sockaddr_in *)&src.sa;
-				inet_ntop(AF_INET, &s->sin_addr, recv_src_str, sizeof(recv_src_str));
-				recv_src_port = ntohs(s->sin_port);
-				struct sockaddr_in *d = (struct sockaddr_in *)&dest.sa;
-				inet_ntop(AF_INET, &d->sin_addr, recv_dest_str, sizeof(recv_dest_str));
-				recv_dest_port = ntohs(d->sin_port);
-			} else if (src.sa.sa_family == AF_INET6) {
-				struct sockaddr_in6 *s = (struct sockaddr_in6 *)&src.sa;
-				inet_ntop(AF_INET6, &s->sin6_addr, recv_src_str, sizeof(recv_src_str));
-				recv_src_port = ntohs(s->sin6_port);
-				struct sockaddr_in6 *d = (struct sockaddr_in6 *)&dest.sa;
-				inet_ntop(AF_INET6, &d->sin6_addr, recv_dest_str, sizeof(recv_dest_str));
-				recv_dest_port = ntohs(d->sin6_port);
-			}
-			
-			/* Get expected server address from connection */
-			// uint16_t expected_src_port = 0;
-			// if (qqpair->conn) {
-			// 	struct sockaddr *expected_sa = quicly_get_peername(qqpair->conn);
-			// 	if (expected_sa && expected_sa->sa_family == AF_INET) {
-			// 		struct sockaddr_in *exp = (struct sockaddr_in *)expected_sa;
-			// 		inet_ntop(AF_INET, &exp->sin_addr, expected_src_str, sizeof(expected_src_str));
-			// 		expected_src_port = ntohs(exp->sin_port);
-			// 	} else if (expected_sa && expected_sa->sa_family == AF_INET6) {
-			// 		struct sockaddr_in6 *exp = (struct sockaddr_in6 *)expected_sa;
-			// 		inet_ntop(AF_INET6, &exp->sin6_addr, expected_src_str, sizeof(expected_src_str));
-			// 		expected_src_port = ntohs(exp->sin6_port);
-			// 	}
-			// }
 			NVME_QQPAIR_DEBUGLOG(qqpair, "Processing packet: type=%s, len=%zu, first_byte=0x%02x\n", 
 					   pkt_type, decoded.octets.len, first_byte);
 
-			quicly_error_t quic_ret = quicly_receive(qqpair->conn, &src.sa, (struct sockaddr *)msg.msg_name, &decoded);
+			quicly_error_t quic_ret = quicly_receive(qqpair->conn, src_addr, dest_addr, &decoded);
 			if (quic_ret != 0) {
 				/* Check for specific PACKET_IGNORED error codes (0xff01-0xff17) */
 				if ((quic_ret >= 0xff80 && quic_ret <= 0xff95) || quic_ret == QUICLY_ERROR_PACKET_IGNORED) {
@@ -1745,14 +1793,14 @@ nvme_quic_read_datagram(struct nvme_quic_qpair *qqpair) {
 				}
 			} else {
 				NVME_QQPAIR_DEBUGLOG(qqpair, "quicly_receive: SUCCESS - type=%s\n", pkt_type);
-
-				if(TAILQ_ENTRY_ENQUEUED(qqpair, link_poll)) {
-					SPDK_DEBUGLOG(nvme, "Immediate sending for ready-command not waiting for official poll trigger for qid=%u\n", qqpair->qpair.id);
-					_quic_send_pending(qqpair);
-					TAILQ_REMOVE_CLEAR(&qgroup->needs_poll, qqpair, link_poll);
-				}
 			}
 		}
+	}
+
+
+	/* Only send if QUIC has pending data (including ACKs) */
+	if (nvme_quic_has_pending_data(qqpair)) {
+		_quic_send_pending(qqpair);
 	}
 
 	return rc;
@@ -1807,16 +1855,42 @@ nvme_quic_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 {
 	struct nvme_quic_qpair *qqpair = nvme_quic_qpair(qpair);
 	quicly_context_t *ctx = quicly_get_context(qqpair->conn);
+
+	uint16_t num_completions = qqpair->async_stream_complete;
+	qqpair->async_stream_complete = 0;
+
 	int rc;
 
 	int64_t first_timeout = quicly_get_first_timeout(qqpair->conn);
 	int64_t now = ctx->now->cb(ctx->now);
-	// NVME_QQPAIR_DEBUGLOG(qqpair, "[PROCESS_COMPL] first_timeout=%ld, now=%ld, diff=%ld ms\n",
-	// 	    first_timeout, now, (first_timeout - now));
 	
-	if(first_timeout <= now) {
-		NVME_QQPAIR_DEBUGLOG(qqpair, "QUIC timeout is due, calling send to trigger timeout handling\n");
-		_quic_send_pending(qqpair);
+	/* Track PTO events for debugging latency spikes */
+	if (first_timeout <= now) {
+		quicly_stats_t stats_before;
+		if (quicly_get_stats(qqpair->conn, &stats_before) == 0) {
+			uint64_t ptos_before = stats_before.num_ptos;
+			
+			NVME_QQPAIR_DEBUGLOG(qqpair, "[PTO_CHECK] Timeout due: first_timeout=%ld, now=%ld, overdue=%ldms\n",
+					     first_timeout, now, (now - first_timeout));
+			NVME_QQPAIR_DEBUGLOG(qqpair, "[PTO_CHECK] Before send: PTOs=%lu, Lost=%lu, Sent=%lu, Acked=%lu, InFlight=%zu\n",
+					     ptos_before, stats_before.num_packets.lost, 
+					     stats_before.num_packets.sent, stats_before.num_packets.ack_received,
+					     stats_before.num_packets.sent - stats_before.num_packets.ack_received - stats_before.num_packets.lost);
+			
+			_quic_send_pending(qqpair);
+			
+			/* Check if PTO actually fired */
+			quicly_stats_t stats_after;
+			if (quicly_get_stats(qqpair->conn, &stats_after) == 0 && stats_after.num_ptos > ptos_before) {
+				SPDK_DEBUGLOG(nvme, "[PTO_FIRED] qpair %u: PTO #%lu fired! RTT=%ums/%ums/%ums, CWND=%u, Outstanding=%zu packets\n",
+					     qpair->id, stats_after.num_ptos, 
+					     stats_after.rtt.minimum, stats_after.rtt.smoothed, stats_after.rtt.variance,
+					     stats_after.cc.cwnd,
+					     stats_after.num_packets.sent - stats_after.num_packets.ack_received - stats_after.num_packets.lost);
+			}
+		} else {
+			_quic_send_pending(qqpair);
+		}
 	}
 
 	SPDK_DEBUGLOG(nvme, "QUIC: qpair_process_completions calling read_datagram for qid=%u\n", qpair->id);
@@ -1829,7 +1903,6 @@ nvme_quic_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 	// 	/* Send any pending QUIC packets generated from queued stream data */
 	// 	// _quic_send_pending(qqpair);
 	// }
-
 
 	/* Receive any incoming UDP datagrams and feed them into QUIC connection */
 	rc = nvme_quic_read_datagram(qqpair);
@@ -1844,11 +1917,8 @@ nvme_quic_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 			/* Don't return errors until the qpair gets disconnected */
 			return 0;
 		}
-
 		goto fail;
 	}
-
-
 
 	/* Handle connection state machine during CONNECTING phase */
 	if (spdk_unlikely(nvme_qpair_get_state(qpair) == NVME_QPAIR_CONNECTING)) {
@@ -1862,7 +1932,7 @@ nvme_quic_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 		}
 	}
 
-	return 0;
+	return num_completions + qqpair->async_stream_complete;
 
 fail:
 	qpair->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_UNKNOWN;
@@ -2077,10 +2147,6 @@ nvme_quic_qpair_connect_sock(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpa
 	/* Store qqpair pointer in connection data for stream callbacks to access */
 	*quicly_get_data(qqpair->conn) = qqpair;
 
-
-
-	// here
-
 	/* Send Initial packet generated by quicly_connect */
 	_quic_send_pending(qqpair);
 
@@ -2286,6 +2352,8 @@ nvme_quic_ctrlr_create_qpair(struct spdk_nvme_ctrlr *ctrlr,
 	qqpair->next_cid.master_id = 0;
 	qqpair->next_cid.thread_id = qid;  /* Unique across all qpairs */
 	qqpair->next_cid.node_id = 0;
+
+	qqpair->async_stream_complete = 0;
 	
 	SPDK_NOTICELOG("CLIENT qid=%u: Initialized next_cid with thread_id=%u for eBPF routing\n",
 	               qid, qqpair->next_cid.thread_id);
@@ -2614,6 +2682,26 @@ nvme_quic_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
 
 	/* Initialize shared QUIC context from spec template */
 	qctrlr->quic_ctx = quicly_spec_context;
+
+	/* Tune QUIC for low-latency localhost/datacenter environments:
+	 * 
+	 * Current investigation: We see 1.7s max latency with 1 PTO firing but 0 packets lost!
+	 * This indicates a spurious PTO where the packet wasn't actually lost, just ACK was delayed.
+	 * 
+	 * For diagnosis, using moderate settings to allow PTOs to fire while logging details:
+	 *   - min_pto = 20ms: Allows PTOs to fire so we can capture what's happening
+	 *   - initcwnd = 100: Prevent flow control blocking
+	 *   - Added detailed logging when PTO fires to track packet counts and timing
+	 */
+	// qctrlr->quic_ctx.initcwnd_packets = 100;  /* 10 → 100 packets (~150KB) to support QD32 */
+	// qctrlr->quic_ctx.loss.min_pto = 20;      /* 1ms → 20ms (diagnostic value to capture PTOs) */
+	// qctrlr->quic_ctx.loss.default_initial_rtt = 10;  /* 66ms → 10ms for faster initial convergence */
+	// qctrlr->quic_ctx.loss.num_speculative_ptos = 0;  /* Disable speculative PTOs for localhost */
+	
+	/* Also increase flow control limits to match larger CWND */
+	qctrlr->quic_ctx.transport_params.max_stream_data.bidi_local = 64 * 1024 * 1024;   /* 1MB → 64MB */
+	qctrlr->quic_ctx.transport_params.max_stream_data.bidi_remote = 64 * 1024 * 1024;  /* 11MB → 64MB */
+	qctrlr->quic_ctx.transport_params.max_data = 256 * 1024 * 1024;  /* 16MB → 256MB */
 
 	/* Use hybrid CID encryptor (plaintext byte 0 for eBPF routing) */
 	qctrlr->quic_ctx.cid_encryptor = nvme_quic_new_plaintext_cid_encryptor();
@@ -2964,9 +3052,43 @@ nvme_quic_poll_group_process_completions(struct spdk_nvme_transport_poll_group *
 	group->num_completions = 0;
 	group->stats.polls++;
 
-	SPDK_NOTICELOG("[TIMING] BEFORE spdk_sock_group_poll()\n");
+	/* Periodically log QUIC stats to track packet loss and PTOs causing latency spikes */
+	group->stats_poll_counter++;
+	if (group->stats_poll_counter % 5000 == 0) {  /* Every 50K polls (~5-10 seconds) */
+		STAILQ_FOREACH(qpair, &tgroup->connected_qpairs, poll_group_stailq) {
+			qqpair = nvme_quic_qpair(qpair);
+			if (qqpair->conn) {
+				quicly_stats_t stats;
+				if (quicly_get_stats(qqpair->conn, &stats) == 0) {
+					uint64_t new_ptos = stats.num_ptos;
+					uint64_t new_lost = stats.num_packets.lost;
+					uint64_t new_resent = stats.num_bytes.stream_data_resent;
+					
+					/* Log detailed stats if any PTOs/loss occurred */
+					if (new_ptos > group->stats_last_ptos || new_lost > group->stats_last_lost || 
+					    new_resent > group->stats_last_resent) {
+						uint64_t inflight = stats.num_packets.sent - stats.num_packets.ack_received - stats.num_packets.lost;
+						SPDK_DEBUGLOG(nvme, "[QUIC_STATS] qpair %u: PTOs=%lu (+%lu), Lost=%lu (+%lu), Resent=%lu (+%lu)\n"
+							     "  Packets: Sent=%lu Acked=%lu InFlight=%lu\n"
+							     "  RTT: min=%ums smooth=%ums var=%ums, CWND=%u bytes\n",
+							     qpair->id, new_ptos, new_ptos - group->stats_last_ptos,
+							     new_lost, new_lost - group->stats_last_lost,
+							     new_resent, new_resent - group->stats_last_resent,
+							     stats.num_packets.sent, stats.num_packets.ack_received, inflight,
+							     stats.rtt.minimum, stats.rtt.smoothed, stats.rtt.variance,
+							     stats.cc.cwnd);
+					}
+					group->stats_last_ptos = new_ptos;
+					group->stats_last_lost = new_lost;
+					group->stats_last_resent = new_resent;
+				}
+			}
+		}
+	}
+
+	//SPDK_DEBUGLOG(nvme, "[TIMING] BEFORE spdk_sock_group_poll()\n");
 	num_events = spdk_sock_group_poll(group->sock_group);
-	SPDK_NOTICELOG("[TIMING] AFTER spdk_sock_group_poll() returned %d events\n", num_events);
+	//SPDK_DEBUGLOG(nvme, "[TIMING] AFTER spdk_sock_group_poll() returned %d events\n", num_events);
 
 	if(num_events > 0) {
 		SPDK_DEBUGLOG(nvme, "spdk_sock_group_poll returned %d events\n", num_events);
@@ -3110,17 +3232,12 @@ nvme_quic_stream_on_destroy(quicly_stream_t *stream, quicly_error_t err)
     }
 
 
-	quicly_sendbuf_init(&quic_req->stream->streambuf.egress);
-	ptls_buffer_init(&quic_req->stream->streambuf.ingress, "", 0);
-
 	struct nvme_quic_qpair *qqpair = quic_req ? quic_req->qqpair : NULL;
 		
 	NVME_QQPAIR_DEBUGLOG(qqpair, "QUIC stream destroyed: stream_id=%" PRIu64 ", err=%d, nvme_stream=%p\n",
 		stream->stream_id, err, nvme_stream);
 
 	nvme_quic_req_put(qqpair, quic_req);
-
-	// nvme_quic_req_complete(quic_req, quic_req->qqpair, &quic_req->cpl, false);
 }
 
 /* NVMe-over-QUIC stream receive callback

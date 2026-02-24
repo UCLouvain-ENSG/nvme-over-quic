@@ -800,6 +800,7 @@ static int
 nvmf_quic_poll_group_poll(struct spdk_nvmf_transpot_poll_group *group)
 {
 	struct spdk_nvmf_quic_poll_group *qgroup;
+	struct spdk_nvmf_quic_qpair *qqpair, *tmp;
 	int num_events;
 
 	qgroup = SPDK_CONTAINEROF(group, struct spdk_nvmf_quic_poll_group, group);
@@ -1285,6 +1286,17 @@ nvme_quic_stream_on_destroy(quicly_stream_t *stream, quicly_error_t err)
 	struct nvme_quic_stream *nvme_stream = stream->data;
 	struct spdk_nvmf_quic_req *quic_req = nvme_stream->req;
 	
+
+	SPDK_DEBUGLOG(nvmf_quic,"Stream %p destroyed with err=%d on reactor %u\n", stream, err, spdk_env_get_current_core());
+
+	ptls_buffer_dispose(&nvme_stream->streambuf.ingress);
+	ptls_buffer_init(&nvme_stream->streambuf.ingress, "", 0);
+
+	quicly_sendbuf_dispose(&nvme_stream->streambuf.egress);
+	quicly_sendbuf_init(&nvme_stream->streambuf.egress);
+
+	// quicly_streambuf_destroy(&stream, err);
+
 	/* Clear stream pointer - request may still be completing */
 	if (quic_req && quic_req->stream && quic_req->stream->quic_stream == stream) {
 		quic_req->stream->quic_stream = NULL;
@@ -1505,75 +1517,62 @@ _nvmf_quic_send_pending(struct spdk_nvmf_quic_qpair *qqpair)
 	struct iovec udp_datagrams[SPDK_NVME_ADMIN_QUEUE_QUIRK_ENTRIES_MULTIPLE];
 	uint8_t buf[SPDK_NVME_ADMIN_QUEUE_QUIRK_ENTRIES_MULTIPLE * SPDK_NVME_QUIC_MAX_UDP_DATAGRAM_SIZE];
 	quicly_error_t ret;
-	num_packets = SPDK_NVME_ADMIN_QUEUE_QUIRK_ENTRIES_MULTIPLE;
+	int total_packets_sent = 0;
 
-	/* Ask quicly to generate UDP packets from queued stream data */
-	ret = quicly_send(qqpair->conn, &dest, &src, udp_datagrams, &num_packets, buf, sizeof(buf));
-	if (ret != 0) {
-		SPDK_ERRLOG("quicly_send failed: %d\n", ret);
-		return;
-	}
+	/* Keep calling quicly_send() until all pending data is sent */
+	do {
+		num_packets = SPDK_NVME_ADMIN_QUEUE_QUIRK_ENTRIES_MULTIPLE;
 
-	SPDK_DEBUGLOG(nvmf_quic, "SERVER: _nvmf_quic_send_pending: quicly_send returned %zu packets\n", 
-	            num_packets);
-
-	if (num_packets == 0) {
-		/* Nothing to send */
-		SPDK_DEBUGLOG(nvmf_quic, "SERVER: quicly_send returned ZERO packets - nothing to send\n");
-		return;
-	}
-
-	/* Log the source address that quicly_send populated */
-	{
-		char src_str[64] = "N/A";
-		uint16_t src_port = 0;
-		if (src.sa.sa_family == AF_INET) {
-			struct sockaddr_in *s = (struct sockaddr_in *)&src.sa;
-			inet_ntop(AF_INET, &s->sin_addr, src_str, sizeof(src_str));
-			src_port = ntohs(s->sin_port);
-		} else if (src.sa.sa_family == AF_INET6) {
-			struct sockaddr_in6 *s = (struct sockaddr_in6 *)&src.sa;
-			inet_ntop(AF_INET6, &s->sin6_addr, src_str, sizeof(src_str));
-			src_port = ntohs(s->sin6_port);
+		/* Ask quicly to generate UDP packets from queued stream data */
+		ret = quicly_send(qqpair->conn, &dest, &src, udp_datagrams, &num_packets, buf, sizeof(buf));
+		if (ret != 0) {
+			SPDK_ERRLOG("quicly_send failed: %d\n", ret);
+			return total_packets_sent;
 		}
-		SPDK_DEBUGLOG(nvmf_quic, "SERVER _nvmf_quic_send_pending: quicly_send populated src=%s:%u, sock=%p, num_packets=%zu\n",
-			    src_str, src_port, qqpair->sock, num_packets);
+
+		if (num_packets == 0) {
+			/* No more packets to send */
+			break;
+		}
+
+		SPDK_DEBUGLOG(nvmf_quic, "SERVER: quicly_send returned %zu packets\n", 
+		            num_packets);
+
+		/* Log destination address */
+		{
+			char dest_str[64] = "N/A";
+			uint16_t dest_port = 0;
+			if (dest.sa.sa_family == AF_INET) {
+				struct sockaddr_in *d = (struct sockaddr_in *)&dest.sa;
+				inet_ntop(AF_INET, &d->sin_addr, dest_str, sizeof(dest_str));
+				dest_port = ntohs(d->sin_port);
+			} else if (dest.sa.sa_family == AF_INET6) {
+				struct sockaddr_in6 *d = (struct sockaddr_in6 *)&dest.sa;
+				inet_ntop(AF_INET6, &d->sin6_addr, dest_str, sizeof(dest_str));
+				dest_port = ntohs(d->sin6_port);
+			} else {
+				SPDK_ERRLOG("dest.sa.sa_family=%d (not AF_INET or AF_INET6!)\n", dest.sa.sa_family);
+			}
+			SPDK_DEBUGLOG(nvmf,"SERVER: Sending %zu packets to dest=%s:%u on reactor %u\n",
+				       num_packets, dest_str, dest_port, spdk_env_get_current_core());
+		}
+		
+		/* Send all packets from this batch */
+		for(int i = 0; i < num_packets; i++) {
+			int rc = spdk_sock_writev_direct(qqpair->sock, &udp_datagrams[i], 1, &dest.sa, quicly_get_socklen(&dest.sa));
+			if (rc < 0) {
+				SPDK_DEBUGLOG(nvmf_quic, "spdk_sock_writev_direct failed: rc=%d, errno=%d (%s)\n", rc, errno, strerror(errno));
+			}
+		}
+		total_packets_sent += num_packets;
+	} while (num_packets > 0);
+
+	if (total_packets_sent > 0) {
+		SPDK_DEBUGLOG(nvmf_quic, "SERVER: _nvmf_quic_send_pending: sent total %d packets\n", 
+		            total_packets_sent);
 	}
 
-	/* Send the generated UDP packets */
-	SPDK_DEBUGLOG(nvmf_quic, "SERVER: Sending %zu UDP datagrams\n", num_packets);
-	
-	/* Log destination address */
-	{
-		char dest_str[64] = "N/A";
-		uint16_t dest_port = 0;
-		if (dest.sa.sa_family == AF_INET) {
-			struct sockaddr_in *d = (struct sockaddr_in *)&dest.sa;
-			inet_ntop(AF_INET, &d->sin_addr, dest_str, sizeof(dest_str));
-			dest_port = ntohs(d->sin_port);
-		} else if (dest.sa.sa_family == AF_INET6) {
-			struct sockaddr_in6 *d = (struct sockaddr_in6 *)&dest.sa;
-			inet_ntop(AF_INET6, &d->sin6_addr, dest_str, sizeof(dest_str));
-			dest_port = ntohs(d->sin6_port);
-		} else {
-			SPDK_ERRLOG("dest.sa.sa_family=%d (not AF_INET or AF_INET6!)\n", dest.sa.sa_family);
-		}
-		SPDK_DEBUGLOG(nvmf,"SERVER: Sending %zu packets to dest=%s:%u (qpair initiator=%s:%u) on reactor %u, socklen=%d\n",
-			       num_packets, dest_str, dest_port, qqpair->initiator_addr, qqpair->initiator_port,
-			       spdk_env_get_current_core(), quicly_get_socklen(&dest.sa));
-	}
-	
-	for(int i=0; i<num_packets; i++) {
-		SPDK_DEBUGLOG(nvmf_quic, "  Datagram %d: len=%zu\n", i, udp_datagrams[i].iov_len);
-		int rc = spdk_sock_writev_direct(qqpair->sock, &udp_datagrams[i], 1, &dest.sa, quicly_get_socklen(&dest.sa));
-		if (rc < 0) {
-			SPDK_DEBUGLOG(nvmf_quic, "spdk_sock_writev_direct failed: rc=%d, errno=%d (%s)\n", rc, errno, strerror(errno));
-		} else {
-			SPDK_DEBUGLOG(nvmf_quic, "spdk_sock_writev_direct sent %d bytes\n", rc);
-		}
-	}
-
-	return (int)num_packets;
+	return total_packets_sent;
 }
 
 
@@ -1780,6 +1779,10 @@ nvmf_quic_send_capsule_resp(struct spdk_nvmf_quic_req *quic_req,
 		SPDK_ERRLOG("Invalid request or stream in send_capsule_resp on reactor %u\n", spdk_env_get_current_core());
 		return;
 	}
+
+	// here
+	
+
 	
 	send_stream = quic_req->stream->quic_stream;
 	quic_req->rsp = quic_req->req.rsp->nvme_cpl;
@@ -1811,12 +1814,9 @@ nvmf_quic_send_capsule_resp(struct spdk_nvmf_quic_req *quic_req,
 		       quic_req->stream->rsp_buf.cbdata, quic_req->stream->rsp_buf.len);
 
 	ret = quicly_streambuf_egress_write_vec(send_stream, &quic_req->stream->rsp_buf);
-	if (ret != 0) {
-		SPDK_ERRLOG("Failed to write response to stream %p: ret=%d on reactor %u\n", send_stream, ret, spdk_env_get_current_core());
-		return;
-	}
 	quicly_streambuf_egress_shutdown(send_stream);
-	
+
+
 	SPDK_DEBUGLOG(nvmf_quic, "Response queued successfully on stream %p, ret=%d on reactor %u\n", send_stream, ret, spdk_env_get_current_core());
 	
 	/* Mark that this qpair has pending data to send */
@@ -1854,7 +1854,6 @@ request_transfer_out(struct spdk_nvmf_request *req)
 	if (spdk_nvme_cpl_is_success(rsp) && req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST) {
 		nvmf_quic_send_c2h_data(qqpair, quic_req);
 	} else {
-
 		nvmf_quic_send_capsule_resp(quic_req, qqpair);
 	}
 
@@ -2517,7 +2516,8 @@ nvmf_quic_req_get(struct spdk_nvmf_quic_qpair *qqpair)
 
 /* QUIC stream callbacks table */
 static const quicly_stream_callbacks_t nvme_quic_stream_callbacks = {
-	nvme_quic_stream_on_destroy,
+	//nvme_quic_stream_on_destroy,
+	quicly_streambuf_destroy,
 	quicly_streambuf_egress_shift,  /* Use streambuf functions since we created with quicly_streambuf_create() */
 	quicly_streambuf_egress_emit,   /* This properly accesses stream->data->egress */
 	nvme_quic_stream_on_send_stop,
@@ -2603,12 +2603,12 @@ nvmf_quic_poll_group_send_pending(struct spdk_nvmf_quic_poll_group *qgroup)
 	// SPDK_ERRLOG("SERVER: poll_group_send_pending called #%lu at %lu ms\n", call_count, now_ms);
 
 	TAILQ_FOREACH_SAFE(qqpair, &qgroup->qpairs, link, tmp) {
-		//_nvmf_quic_send_pending(qqpair);
-
-		if(quicly_get_first_timeout(qqpair->conn) <= ctx->now->cb(ctx->now)) {
-			SPDK_DEBUGLOG(nvmf,"poll_group_send_pending: Sending pending data for qpair %p (conn=%p) due to timeout\n", qqpair, qqpair->conn);
-			_nvmf_quic_send_pending(qqpair);
-		}
+		SPDK_DEBUGLOG(nvmf,"poll_group_send_pending: Sending pending data for qpair %p (conn=%p) immeidate send\n", qqpair, qqpair->conn);
+		_nvmf_quic_send_pending(qqpair);
+		// if(quicly_get_first_timeout(qqpair->conn) <= ctx->now->cb(ctx->now)) {
+		// 	SPDK_DEBUGLOG(nvmf,"poll_group_send_pending: Sending pending data for qpair %p (conn=%p) due to timeout\n", qqpair, qqpair->conn);
+		// 	_nvmf_quic_send_pending(qqpair);
+		// }
 	}
 }
 
@@ -2830,6 +2830,13 @@ nvmf_quic_datagram_cb(void *arg, struct spdk_sock_group *group, struct spdk_sock
 					if (!qqpair->in_hash_table && qqpair->group) {
 						nvmf_quic_add_qpair_to_hash(qqpair->group, qqpair, qqpair->conn);
 					}
+
+					/* CRITICAL: Immediately flush server's response to avoid HANDSHAKE key race.
+					 * quicly_accept() queues the server's INITIAL response, but doesn't send it.
+					 * Client may send HANDSHAKE packets before server sends response, causing
+					 * QUICLY_ERROR_PACKET_IGNORED_21 (0xff93) because handshake keys aren't
+					 * generated until server sends its INITIAL response. */
+					_nvmf_quic_send_pending(qqpair);
 					
 				} else {
 					SPDK_ERRLOG("quicly_accept failed: %d (0x%x)\n", ret, ret);
@@ -3652,6 +3659,12 @@ _nvmf_quic_qpair_destroy(void *_qqpair)
 	// spdk_dma_free(qqpair->);
 	free(qqpair->reqs);
 	spdk_free(qqpair->bufs);
+
+	if (qqpair->conn) {
+		quicly_free(qqpair->conn);
+		qqpair->conn = NULL;
+	}
+
 	spdk_trace_unregister_owner(qqpair->qpair.trace_id);
 	free(qqpair);
 
@@ -3814,7 +3827,15 @@ nvmf_quic_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
 static void on_closed_by_remote(quicly_closed_by_remote_t *self, quicly_conn_t *conn, quicly_error_t err, uint64_t frame_type,
                                 const char *reason, size_t reason_len)
 {
-	SPDK_DEBUGLOG(nvmf,"Connection closed by remote: code=%" PRId64 "\n", err);
+	struct spdk_nvmf_quic_qpair *qqpair = *quicly_get_data(conn);
+	
+	SPDK_DEBUGLOG(nvmf,"Connection closed by remote: code=%" PRId64 ", qpair=%p\n", err, qqpair);
+	
+	if (qqpair && qqpair->state <= NVMF_QUIC_QPAIR_STATE_RUNNING) {
+		nvmf_quic_qpair_set_recv_state(qqpair, NVME_QUIC_RECV_STATE_ERROR);
+		nvmf_quic_qpair_set_state(qqpair, NVMF_QUIC_QPAIR_STATE_EXITING);
+		spdk_nvmf_qpair_disconnect(&qqpair->qpair);
+	}
 }
 
 static quicly_closed_by_remote_t closed_by_remote = {&on_closed_by_remote};
@@ -3830,11 +3851,64 @@ static quicly_error_t on_generate_resumption_token(quicly_generate_resumption_to
 
 static quicly_generate_resumption_token_t generate_resumption_token = {&on_generate_resumption_token};
 
+/* 
+Previous scheduler_do_send implementation used default scheduler for all streams, which caused head-of-line blocking for batch of streams with one stream having a large amount of data to send.
+*/
+// static quicly_error_t scheduler_do_send(quicly_stream_scheduler_t *sched, quicly_conn_t *conn, quicly_send_context_t *s)
+// {
+// 	/* Use default scheduler for server */
+// 	return quicly_default_stream_scheduler.do_send(&quicly_default_stream_scheduler, conn, s);
+// }
+
+
+/* 
+This new implementation uses a depth-first approach to try to send all data from one stream before moving to the next, which should help reduce latency for smaller streams that are blocked behind larger streams in the default round-robin scheduler.
+*/
 static quicly_error_t scheduler_do_send(quicly_stream_scheduler_t *sched, quicly_conn_t *conn, quicly_send_context_t *s)
 {
-	/* Use default scheduler for server */
-	return quicly_default_stream_scheduler.do_send(&quicly_default_stream_scheduler, conn, s);
+	struct st_quicly_default_scheduler_state_t *sched_state = 
+		&((struct _st_quicly_conn_public_t *)conn)->_default_scheduler;
+	int conn_is_blocked = quicly_is_blocked(conn);
+	quicly_error_t ret = 0;
+
+	/* Move blocked streams to active if connection is unblocked */
+	if (!conn_is_blocked)
+		quicly_linklist_insert_list(&sched_state->active, &sched_state->blocked);
+
+	/* DFS: Send all data from first stream before moving to next */
+	while (quicly_can_send_data(conn, s) && quicly_linklist_is_linked(&sched_state->active)) {
+		/* Get first stream from active list */
+		quicly_stream_t *stream =
+			(void *)((char *)sched_state->active.next - offsetof(quicly_stream_t, _send_aux.pending_link.default_scheduler));
+		
+		/* Only unlink if stream is blocked by connection-level flow control */
+		if (conn_is_blocked && !quicly_stream_can_send(stream, 0)) {
+			quicly_linklist_unlink(&stream->_send_aux.pending_link.default_scheduler);
+			quicly_linklist_insert(sched_state->blocked.prev, &stream->_send_aux.pending_link.default_scheduler);
+			continue;
+		}
+		
+		/* Send data from this stream */
+		if ((ret = quicly_send_stream(stream, s)) != 0) {
+			if (ret == QUICLY_ERROR_SENDBUF_FULL) {
+				/* Buffer full - stream still has data, keep it at front */
+				assert(quicly_stream_can_send(stream, 1));
+			}
+			break;
+		}
+		
+		/* Check if stream still has data to send */
+		conn_is_blocked = quicly_is_blocked(conn);
+		if (!quicly_stream_can_send(stream, 1)) {
+			/* Stream exhausted - remove from list and move to next stream */
+			quicly_linklist_unlink(&stream->_send_aux.pending_link.default_scheduler);
+		}
+		/* else: stream still has data - keep it at front of list for next iteration (DFS behavior) */
+	}
+
+	return ret;
 }
+
 
 
 static struct spdk_nvmf_transport_poll_group *
@@ -3975,7 +4049,7 @@ nvmf_quic_req_complete(struct spdk_nvmf_request *req)
 	qtransport = SPDK_CONTAINEROF(req->qpair->transport, struct spdk_nvmf_quic_transport, transport);
 	quic_req = SPDK_CONTAINEROF(req, struct spdk_nvmf_quic_req, req);
 
-	SPDK_DEBUGLOG(nvmf,"nvmf_quic_req_complete: req=%p, state=%d, opc=0x%x\n",
+	SPDK_DEBUGLOG(nvmf_quic,"nvmf_quic_req_complete: req=%p, state=%d, opc=0x%x\n",
 		       quic_req, quic_req->state, quic_req->cmd.opc);
 
 	switch(quic_req->state) {
