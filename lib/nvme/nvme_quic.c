@@ -1180,9 +1180,9 @@ nvme_quic_sendbuf_shift(quicly_stream_t *stream, size_t delta)
 				return;
 			}
             // free(sb->vecs.entries);
-            // sb->vecs.entries = NULL;
-            // sb->vecs.size = 0;
-            // sb->vecs.capacity = 0;
+            sb->vecs.entries = NULL;
+            sb->vecs.size = 0;
+            sb->vecs.capacity = 0;
 			NVME_QQPAIR_DEBUGLOG(qqpair, "[SHIFT] **VECS FREED**: entries now NULL, size=0\n");
         }
     }
@@ -1338,7 +1338,7 @@ end:
 	
 	
 	/* BUG FIX: Check opcode (cmd.opc) not command ID (cmd.cid)! */
-	if(quic_req->req->cmd.opc != SPDK_NVME_OPC_WRITE) {
+	if (quic_req->req->cmd.opc != SPDK_NVME_OPC_WRITE || quic_req->in_capsule_data) {
 		quicly_streambuf_egress_shutdown(nvme_stream->quic_stream);
 	}
 	
@@ -1425,7 +1425,7 @@ nvme_quic_h2c_data_send_complete(quicly_sendbuf_vec_t *vec)
 		}
 	}
 
-	nvme_quic_req_complete_safe(quic_req);
+	// nvme_quic_req_complete_safe(quic_req);
 }
 
 
@@ -1447,31 +1447,31 @@ nvme_quic_send_h2c_data(struct nvme_quic_req *quic_req)
                  quic_req->datao, quic_req->r2t_len);
     
     /* Skip iovecs until we reach the starting offset */
-    while (offset >= quic_req->iov[idx].iov_len && idx < quic_req->iovcnt) {
-        offset -= quic_req->iov[idx].iov_len;
-        idx++;
-    }
+    // while (offset >= quic_req->iov[idx].iov_len && idx < quic_req->iovcnt) {
+    //     offset -= quic_req->iov[idx].iov_len;
+    //     idx++;
+    // }
     
-    /* Build send_iov array with exactly r2t_len bytes */
-    while (remain_len > 0 && idx < quic_req->iovcnt && send_iovcnt < NVME_QUIC_MAX_SGL_DESCRIPTORS) {
-        uint32_t iov_remain = quic_req->iov[idx].iov_len - offset;
-        uint32_t copy_len = spdk_min(iov_remain, remain_len);
+    // /* Build send_iov array with exactly r2t_len bytes */
+    // while (remain_len > 0 && idx < quic_req->iovcnt && send_iovcnt < NVME_QUIC_MAX_SGL_DESCRIPTORS) {
+    //     uint32_t iov_remain = quic_req->iov[idx].iov_len - offset;
+    //     uint32_t copy_len = spdk_min(iov_remain, remain_len);
         
-        send_iov[send_iovcnt].iov_base = (uint8_t *)quic_req->iov[idx].iov_base + offset;
-        send_iov[send_iovcnt].iov_len = copy_len;
-        send_iovcnt++;
+    //     send_iov[send_iovcnt].iov_base = (uint8_t *)quic_req->iov[idx].iov_base + offset;
+    //     send_iov[send_iovcnt].iov_len = copy_len;
+    //     send_iovcnt++;
         
-        remain_len -= copy_len;
-        offset = 0;  // After first iovec, offset is always 0
-        idx++;
-    }
+    //     remain_len -= copy_len;
+    //     offset = 0;  // After first iovec, offset is always 0
+    //     idx++;
+    // }
     
-    assert(remain_len == 0);  // Must have sent exactly r2t_len
+    // assert(remain_len == 0);  // Must have sent exactly r2t_len
     
     /* Now pass the partial iovec array to QUIC */
     nvme_quic_stream_set_data_buf(nvme_stream,
-                      send_iov,
-                      send_iovcnt,
+                      quic_req->iov,
+                      quic_req->r2t_len,
                       &nvme_quic_h2c_callbacks);
     
     quicly_streambuf_egress_write_vec(nvme_stream->quic_stream, 
