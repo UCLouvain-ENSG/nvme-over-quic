@@ -1179,7 +1179,7 @@ nvme_quic_sendbuf_shift(quicly_stream_t *stream, size_t delta)
 				quicly_stream_sync_sendbuf(stream, 0);
 				return;
 			}
-            // free(sb->vecs.entries);
+            free(sb->vecs.entries);
             sb->vecs.entries = NULL;
             sb->vecs.size = 0;
             sb->vecs.capacity = 0;
@@ -1429,7 +1429,7 @@ nvme_quic_h2c_data_send_complete(quicly_sendbuf_vec_t *vec)
 }
 
 
-static const quicly_streambuf_sendvec_callbacks_t nvme_quic_h2c_callbacks = {nvme_quic_iovs_flatten, nvme_quic_h2c_data_send_complete};
+static const quicly_streambuf_sendvec_callbacks_t nvme_quic_h2c_callbacks = {nvme_quic_iovs_flatten };
 
 static void
 nvme_quic_send_h2c_data(struct nvme_quic_req *quic_req)
@@ -1477,6 +1477,30 @@ nvme_quic_send_h2c_data(struct nvme_quic_req *quic_req)
     quicly_streambuf_egress_write_vec(nvme_stream->quic_stream, 
                       &nvme_stream->data_buf);
 
+
+	quic_req->datao += quic_req->r2t_len;  // Update offset for next send
+	
+	quic_req->ordering.bits.h2c_send_waiting_ack = 0;
+	quic_req->ordering.bits.send_ack = 1;
+
+
+
+	if (quic_req->datao >= quic_req->req->payload_size) {
+		/* All data sent, mark complete and wait for CQE */
+		quic_req->ordering.bits.data_recv = 1;
+		quic_req->state = NVME_QUIC_REQ_AWAIT_CQE;
+
+		quicly_streambuf_egress_shutdown(nvme_stream->quic_stream);
+		
+		if (quic_req->ordering.bits.domain_in_use) {
+			spdk_memory_domain_invalidate_data(quic_req->req->payload.opts->memory_domain,
+							   quic_req->req->payload.opts->memory_domain_ctx, 
+							   quic_req->iov, quic_req->iovcnt);
+		}
+	}
+
+
+	// nvme_quic_cond_schedule_qpair_polling(qqpair);
 }
 
 
