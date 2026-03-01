@@ -431,9 +431,28 @@ fail:
 	return -ENOMEM;
 }
 
+static void _quic_send_pending(struct nvme_quic_qpair *qqpair);
 static void nvme_quic_qpair_abort_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr);
 static int nvme_quic_ctrlr_connect_qpair_poll(struct spdk_nvme_ctrlr *ctrlr,
 		struct spdk_nvme_qpair *qpair);
+
+
+
+static void
+nvme_quic_grace_disconnect_qpair(struct spdk_nvme_qpair *qpair)
+{
+	// Send CONNECTION CLOSE with NO_ERROR to allow graceful shutdown and avoid unnecessary retransmissions
+	struct nvme_quic_qpair *qqpair = nvme_quic_qpair(qpair);
+	if (qqpair->conn) {
+		NVME_QQPAIR_DEBUGLOG(qqpair, "Initiating graceful QUIC disconnect for qpair %p\n", qqpair);
+		quicly_close(qqpair->conn, 0, "");
+	} else {
+		NVME_QQPAIR_DEBUGLOG(qqpair, "No active QUIC connection for qpair %p, skipping graceful disconnect\n", qqpair);
+	}
+
+	_quic_send_pending(qqpair);
+}
+
 
 static void
 nvme_quic_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
@@ -447,6 +466,13 @@ nvme_quic_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme
 		TAILQ_REMOVE_CLEAR(&group->needs_poll, qqpair, link_poll);
 	}
 
+	nvme_quic_grace_disconnect_qpair(qpair);
+
+	if (qqpair->conn) {
+		quicly_free(qqpair->conn);
+		qqpair->conn = NULL;
+	}
+
 	rc = spdk_sock_close(&qqpair->sock);
 
 	if (qqpair->sock != NULL) {
@@ -457,7 +483,7 @@ nvme_quic_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme
 
 	nvme_quic_qpair_abort_reqs(qpair, qpair->abort_dnr);
 
-	// SPDK_ERRLOG("Disconnected QUIC qpair %p\n", qqpair);
+	SPDK_DEBUGLOG(nvme, "Disconnected QUIC qpair %p\n", qqpair);
 
 	/* If the qpair is marked as asynchronous, let it go through the process_completions() to
 	 * let any outstanding requests (e.g. those with outstanding accel operations) complete.
@@ -467,14 +493,14 @@ nvme_quic_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme
 	if (qpair->async) {
 		nvme_quic_qpair_set_recv_state(qqpair, NVME_QUIC_RECV_STATE_QUIESCING);
 		if(nvme_qpair_get_state(&qqpair->qpair) == NVME_QPAIR_DISCONNECTING) {
-			//SPDK_ERRLOG("Continuing disconnect process for async qpair %p\n", qqpair);
+			SPDK_DEBUGLOG(nvme,"Continuing disconnect process for async qpair %p\n", qqpair);
 			nvme_transport_ctrlr_disconnect_qpair_done(&qqpair->qpair);
 
-			// if (TAILQ_EMPTY(&qqpair->outstanding_reqs)) {
-			// 	if (nvme_qpair_get_state(&qqpair->qpair) == NVME_QPAIR_DISCONNECTING) {
-			// 		nvme_transport_ctrlr_disconnect_qpair_done(&qqpair->qpair);
-			// 	}
-			// }
+			if (TAILQ_EMPTY(&qqpair->outstanding_reqs)) {
+				if (nvme_qpair_get_state(&qqpair->qpair) == NVME_QPAIR_DISCONNECTING) {
+					nvme_transport_ctrlr_disconnect_qpair_done(&qqpair->qpair);
+				}
+			}
 		}
 		
 
@@ -498,12 +524,6 @@ nvme_quic_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 	if (!qqpair->shared_stats) {
 		free(qqpair->stats);
 	}
-
-	if (qqpair->conn) {
-		quicly_free(qqpair->conn);
-		qqpair->conn = NULL;
-	}
-
 	free(qqpair);
 
 	return 0;
@@ -642,8 +662,8 @@ _quic_send_pending(struct nvme_quic_qpair *qqpair)
 
 		if (num_packets == 0) {
 			/* No more packets to send */
-			SPDK_DEBUGLOG(nvme, "Nothing to send PAKCET : quicly_send returned %zu packets\n", 
-						num_packets);
+			// SPDK_DEBUGLOG(nvme, "Nothing to send PAKCET : quicly_send returned %zu packets\n", 
+			// 			num_packets);
 			break;
 		}
 
@@ -1700,7 +1720,7 @@ nvme_quic_read_datagram(struct nvme_quic_qpair *qqpair) {
 	
 	/* Read all incoming UDP packets for this loop */
 	int read_count = 0;
-	SPDK_NOTICELOG("QUIC: read_datagram called for qid=%u, sock=%p\n", qqpair->qpair.id, sock);
+	// SPDK_NOTICELOG("QUIC: read_datagram called for qid=%u, sock=%p\n", qqpair->qpair.id, sock);
 	while(1) {
 		errno = 0; /* Clear errno before recvmsg */
 		rc = nvme_quic_read_data_with_msghdr(sock, sizeof(recv_buf), recv_buf, &msg);
@@ -1708,8 +1728,8 @@ nvme_quic_read_datagram(struct nvme_quic_qpair *qqpair) {
 		if(rc <= 0) {
 			/* No more data to read */
 			if (read_count == 0) {
-				SPDK_DEBUGLOG(nvme, "No data read on first attempt for qid=%u! rc=%d, errno=%d (%s)\n",
-					    qqpair->qpair.id, rc, saved_errno, strerror(saved_errno));
+				// SPDK_DEBUGLOG(nvme, "No data read on first attempt for qid=%u! rc=%d, errno=%d (%s)\n",
+				// 	    qqpair->qpair.id, rc, saved_errno, strerror(saved_errno));
 			} else {
 				SPDK_DEBUGLOG(nvme, "Read %d datagrams for qid=%u, stopping (rc=%d, errno=%d)\n",
 					      read_count, qqpair->qpair.id, rc, saved_errno);
@@ -1917,7 +1937,7 @@ nvme_quic_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 		}
 	}
 
-	SPDK_DEBUGLOG(nvme, "QUIC: qpair_process_completions calling read_datagram for qid=%u\n", qpair->id);
+	// SPDK_DEBUGLOG(nvme, "QUIC: qpair_process_completions calling read_datagram for qid=%u\n", qpair->id);
 	/* Flush pending outgoing packets (analogous to spdk_sock_flush in TCP) */
 	// if (qpair->poll_group == NULL) {
 	// 	if (qpair->ctrlr->timeout_enabled) {

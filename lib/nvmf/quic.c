@@ -885,10 +885,10 @@ nvmf_quic_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 	TAILQ_REMOVE(&qgroup->qpairs, qqpair, link);
 
 	/* Remove socket from sock group before destroying qpair */
-	rc = spdk_sock_group_remove_sock(qgroup->sock_group, qqpair->sock);
-	if (rc != 0) {
-		SPDK_ERRLOG("spdk_sock_group_remove_sock failed on reactor %u\n", spdk_env_get_current_core());
-	}
+	// rc = spdk_sock_group_remove_sock(qgroup->sock_group, qqpair->sock);
+	// if (rc != 0) {
+	// 	SPDK_ERRLOG("spdk_sock_group_remove_sock failed on reactor %u\n", spdk_env_get_current_core());
+	// }
 
 	nvmf_quic_abort_await_buffer_reqs(qqpair);
 
@@ -1995,7 +1995,7 @@ nvmf_quic_req_process(struct spdk_nvmf_quic_transport *qtransport,
 	assert(quic_req->state != QUIC_REQUEST_STATE_FREE);
 
 	if(!spdk_nvmf_qpair_is_active(&qqpair->qpair)) {
-		if(quic_req->state != QUIC_REQUEST_STATE_NEED_BUFFER) {
+		if(quic_req->state == QUIC_REQUEST_STATE_NEED_BUFFER) {
 			nvmf_quic_request_get_buffers_abort(quic_req);
 		}
 		nvmf_quic_req_set_state(quic_req, QUIC_REQUEST_STATE_COMPLETED);
@@ -2608,7 +2608,7 @@ nvmf_quic_poll_group_send_pending(struct spdk_nvmf_quic_poll_group *qgroup)
 	// SPDK_ERRLOG("SERVER: poll_group_send_pending called #%lu at %lu ms\n", call_count, now_ms);
 
 	TAILQ_FOREACH_SAFE(qqpair, &qgroup->qpairs, link, tmp) {
-		SPDK_DEBUGLOG(nvmf,"poll_group_send_pending: Sending pending data for qpair %p (conn=%p) immeidate send\n", qqpair, qqpair->conn);
+		// SPDK_DEBUGLOG(nvmf,"poll_group_send_pending: Sending pending data for qpair %p (conn=%p) immeidate send\n", qqpair, qqpair->conn);
 		_nvmf_quic_send_pending(qqpair);
 		// if(quicly_get_first_timeout(qqpair->conn) <= ctx->now->cb(ctx->now)) {
 		// 	SPDK_DEBUGLOG(nvmf,"poll_group_send_pending: Sending pending data for qpair %p (conn=%p) due to timeout\n", qqpair, qqpair->conn);
@@ -3585,7 +3585,8 @@ nvmf_quic_request_free(void *cb_arg)
 
 	SPDK_DEBUGLOG(nvmf,"Freeing QUIC request %p\n", quic_req);
 	qtransport = SPDK_CONTAINEROF(quic_req->req.qpair->transport, struct spdk_nvmf_quic_transport, transport);
-	nvmf_quic_req_set_state(quic_req, QUIC_REQUEST_STATE_FREE);
+
+	nvmf_quic_req_set_state(quic_req, QUIC_REQUEST_STATE_COMPLETED);
 	nvmf_quic_req_process(qtransport, quic_req);
 }
 
@@ -3644,8 +3645,11 @@ _nvmf_quic_qpair_destroy(void *_qqpair)
 
 	SPDK_DEBUGLOG(nvmf,"enter\n");
 
-	err = spdk_sock_close(&qqpair->sock);
-	assert(err == 0);
+	if (qqpair->conn) {
+		quicly_free(qqpair->conn);
+		qqpair->conn = NULL;
+	}
+
 	nvmf_quic_cleanup_all_states(qqpair);
 
 	if (qqpair->state_cntr[QUIC_REQUEST_STATE_FREE] != qqpair->resource_count) {
@@ -3664,11 +3668,6 @@ _nvmf_quic_qpair_destroy(void *_qqpair)
 	// spdk_dma_free(qqpair->);
 	free(qqpair->reqs);
 	spdk_free(qqpair->bufs);
-
-	if (qqpair->conn) {
-		quicly_free(qqpair->conn);
-		qqpair->conn = NULL;
-	}
 
 	spdk_trace_unregister_owner(qqpair->qpair.trace_id);
 	free(qqpair);
@@ -3829,18 +3828,28 @@ nvmf_quic_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
 	free(qgroup);
 }
 
-static void on_closed_by_remote(quicly_closed_by_remote_t *self, quicly_conn_t *conn, quicly_error_t err, uint64_t frame_type,
+static void 
+on_closed_by_remote(quicly_closed_by_remote_t *self, quicly_conn_t *conn, quicly_error_t err, uint64_t frame_type,
                                 const char *reason, size_t reason_len)
 {
 	struct spdk_nvmf_quic_qpair *qqpair = *quicly_get_data(conn);
 	
-	SPDK_DEBUGLOG(nvmf,"Connection closed by remote: code=%" PRId64 ", qpair=%p\n", err, qqpair);
-	
-	if (qqpair && qqpair->state <= NVMF_QUIC_QPAIR_STATE_RUNNING) {
+	if (QUICLY_ERROR_IS_QUIC_TRANSPORT(err)) {
+		SPDK_DEBUGLOG(nvmf, "QUIC transport close: code=0x%" PRIx64 "; frame=%" PRIu64 "; reason=%.*s\n",
+			    QUICLY_ERROR_GET_ERROR_CODE(err), frame_type, (int)reason_len, reason);
 		nvmf_quic_qpair_set_recv_state(qqpair, NVME_QUIC_RECV_STATE_ERROR);
-		nvmf_quic_qpair_set_state(qqpair, NVMF_QUIC_QPAIR_STATE_EXITING);
-		spdk_nvmf_qpair_disconnect(&qqpair->qpair);
+	} else if (QUICLY_ERROR_IS_QUIC_APPLICATION(err)) {
+		SPDK_ERRLOG("QUIC application close: code=0x%" PRIx64 "; reason=%.*s\n",
+			    QUICLY_ERROR_GET_ERROR_CODE(err), (int)reason_len, reason);
+	} else if (err == QUICLY_ERROR_RECEIVED_STATELESS_RESET) {
+		SPDK_ERRLOG("QUIC stateless reset\n");
+	} else if (err == QUICLY_ERROR_NO_COMPATIBLE_VERSION) {
+		SPDK_ERRLOG("QUIC no compatible version\n");
+	} else {
+		SPDK_ERRLOG("QUIC unexpected close: code=%" PRId64 "\n", err);
 	}
+
+	nvmf_quic_qpair_disconnect(&qqpair->qpair);
 }
 
 static quicly_closed_by_remote_t closed_by_remote = {&on_closed_by_remote};
