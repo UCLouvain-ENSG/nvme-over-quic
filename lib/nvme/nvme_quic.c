@@ -3138,6 +3138,25 @@ nvme_quic_poll_group_process_completions(struct spdk_nvme_transport_poll_group *
 		SPDK_DEBUGLOG(nvme, "spdk_sock_group_poll returned %d events\n", num_events);
 	}
 
+	/* PTO timer sweep: proactively drive QUIC retransmissions for all connected qpairs.
+	 * Without this, an IO qpair with all in-flight responses lost will never retransmit
+	 * because its sock_cb cannot fire (no incoming packets) and no new requests can be
+	 * submitted (all CID slots occupied by stuck in-flight requests). The admin qpair
+	 * "accidentally" works because periodic Keep Alive submissions force process_completions,
+	 * but IO qpairs have no such trigger. We must sweep proactively here. */
+	STAILQ_FOREACH(qpair, &tgroup->connected_qpairs, poll_group_stailq) {
+		qqpair = nvme_quic_qpair(qpair);
+		if (qqpair->conn) {
+			quicly_context_t *ctx = quicly_get_context(qqpair->conn);
+			int64_t now = ctx->now->cb(ctx->now);
+			if (quicly_get_first_timeout(qqpair->conn) <= now) {
+				SPDK_DEBUGLOG(nvme, "[PTO_SWEEP] qpair %u: timeout expired, flushing send queue\n",
+					      qpair->id);
+				_quic_send_pending(qqpair);
+			}
+		}
+	}
+
 	STAILQ_FOREACH_SAFE(qpair, &tgroup->disconnected_qpairs, poll_group_stailq, tmp_qpair) {
 		qqpair = nvme_quic_qpair(qpair);
 		if (nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTING) {
