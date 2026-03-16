@@ -4,10 +4,11 @@
 /* QUIC packet format - we receive UDP payload directly */
 #define QUIC_LONG_PACKET_BIT    0x80
 
-/* Map to hold socket file descriptors */
+/* Map to hold socket file descriptors - sized for up to 64 reactors */
+#define MAX_REUSEPORT_SOCKETS 64
 struct {
     __uint(type, BPF_MAP_TYPE_REUSEPORT_SOCKARRAY);
-    __uint(max_entries, 4);
+    __uint(max_entries, MAX_REUSEPORT_SOCKETS);
     __type(key, __u32);
     __type(value, __u32);
 } reuseport_array SEC(".maps");
@@ -20,10 +21,15 @@ struct {
     __type(value, __u32);
 } config_map SEC(".maps");
 
-/* Debug/stats map to track what eBPF is seeing */
+/* Debug/stats map:
+ * 0..N-1  : per-reactor routing counters (N = num_sockets, up to 64)
+ * 64      : total packets
+ * 65      : parse errors
+ * 66      : bpf_sk_select_reuseport errors
+ */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 16);  /* 0-3: per-index counters, 4-7: per-shard counters, 8: total packets, 9: errors */
+    __uint(max_entries, 128);
     __type(key, __u32);
     __type(value, __u64);
 } debug_stats SEC(".maps");
@@ -59,8 +65,8 @@ int select_socket(struct sk_reuseport_md *reuse_md) {
         //bpf_printk("[27-29]: %02x %02x %02x", bytes[27], bytes[28], bytes[29]);
     }
     
-    /* Increment total packet counter (key=8) */
-    stats_key = 8;
+    /* Increment total packet counter (key=64) */
+    stats_key = 64;
     counter = bpf_map_lookup_elem(&debug_stats, &stats_key);
     if (counter) {
         __sync_fetch_and_add(counter, 1);
@@ -77,8 +83,8 @@ int select_socket(struct sk_reuseport_md *reuse_md) {
     
     if (quic_pkt + 1 > (__u8 *)data_end) {
         //bpf_printk("ERROR: QUIC packet too short");
-        /* Increment error counter (key=9) */
-        stats_key = 9;
+        /* Increment error counter (key=65) */
+        stats_key = 65;
         counter = bpf_map_lookup_elem(&debug_stats, &stats_key);
         if (counter) {
             __sync_fetch_and_add(counter, 1);
@@ -148,19 +154,8 @@ int select_socket(struct sk_reuseport_md *reuse_md) {
     index = shard_id % num_sockets;
     //bpf_printk("Routing to index=%u (shard_id=%u)", index, shard_id);
     
-    /* Track per-index routing (keys 0-3) */
+    /* Track per-index routing (keys 0..num_sockets-1) */
     stats_key = index;
-    counter = bpf_map_lookup_elem(&debug_stats, &stats_key);
-    if (counter) {
-        __sync_fetch_and_add(counter, 1);
-    }
-    
-    /* Track per-shard_id (keys 10-13 for shard_id 0-3, key 14 for shard_id >= 4) */
-    if (shard_id < 4) {
-        stats_key = 10 + shard_id;
-    } else {
-        stats_key = 14;  /* Track shard_id >= 4 separately */
-    }
     counter = bpf_map_lookup_elem(&debug_stats, &stats_key);
     if (counter) {
         __sync_fetch_and_add(counter, 1);
@@ -172,9 +167,9 @@ int select_socket(struct sk_reuseport_md *reuse_md) {
     
     //bpf_printk("bpf_sk_select_reuseport returned: %d", ret);
     
-    /* Track bpf_sk_select_reuseport errors (key=15) */
+    /* Track bpf_sk_select_reuseport errors (key=66) */
     if (ret < 0) {
-        stats_key = 15;
+        stats_key = 66;
         counter = bpf_map_lookup_elem(&debug_stats, &stats_key);
         if (counter) {
             __sync_fetch_and_add(counter, 1);

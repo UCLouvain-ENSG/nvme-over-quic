@@ -118,22 +118,6 @@ static struct spdk_sock_impl_opts g_udp_impl_opts = {
 	.enable_ktls = false,
 };
 
-#ifdef SPDK_CONFIG_EBPF
-/* Global eBPF state - loaded ONCE, shared by all SO_REUSEPORT sockets */
-static struct bpf_object *g_ebpf_obj = NULL;
-static int g_ebpf_prog_fd = -1;
-static int g_ebpf_map_fd = -1;
-static int g_ebpf_config_map_fd = -1;  /* config_map: key=0 → num_sockets */
-static bool g_ebpf_attached = false;
-static pthread_mutex_t g_ebpf_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/* Track socket FDs for populating the reuseport_array map
- * Array is indexed by (core % MAX_REUSEPORT_SOCKETS) so shard routing works correctly */
-#define MAX_REUSEPORT_SOCKETS 4
-static int g_socket_fds[MAX_REUSEPORT_SOCKETS] = {-1, -1, -1, -1};
-static int g_socket_count = 0;
-#endif
-
 /* Forward declaration */
 static int _sock_flush(struct spdk_sock *sock);
 static struct spdk_sock_map g_map = {
@@ -145,17 +129,6 @@ __attribute((destructor)) static void
 udp_sock_map_cleanup(void)
 {
 	spdk_sock_map_cleanup(&g_map);
-
-#ifdef SPDK_CONFIG_EBPF
-	if (g_ebpf_obj != NULL) {
-		bpf_object__close(g_ebpf_obj);
-		g_ebpf_obj = NULL;
-		g_ebpf_prog_fd = -1;
-		g_ebpf_map_fd = -1;
-		g_ebpf_attached = false;
-		g_socket_count = 0;
-	}
-#endif
 }
 
 #define __udp_sock(sock) (struct spdk_udp_sock *)sock
@@ -177,80 +150,6 @@ udp_sock_map_cleanup(void)
 #ifndef SO_ATTACH_REUSEPORT_EBPF
 #define SO_ATTACH_REUSEPORT_EBPF 51
 #endif
-
-/* Load eBPF program globally - called ONCE */
-static int
-load_ebpf_program(const char *path)
-{
-	struct bpf_program *prog;
-	int rc;
-
-	pthread_mutex_lock(&g_ebpf_lock);
-
-	if (g_ebpf_prog_fd >= 0) {
-		/* Already loaded */
-		pthread_mutex_unlock(&g_ebpf_lock);
-		return g_ebpf_prog_fd;
-	}
-
-	g_ebpf_obj = bpf_object__open_file(path, NULL);
-	if (g_ebpf_obj == NULL) {
-		SPDK_ERRLOG("Failed to open eBPF object: %s\n", path);
-		pthread_mutex_unlock(&g_ebpf_lock);
-		return -1;
-	}
-
-	rc = bpf_object__load(g_ebpf_obj);
-	if (rc != 0) {
-		SPDK_ERRLOG("Failed to load eBPF object: %d\n", rc);
-		bpf_object__close(g_ebpf_obj);
-		g_ebpf_obj = NULL;
-		pthread_mutex_unlock(&g_ebpf_lock);
-		return -1;
-	}
-
-	prog = bpf_object__find_program_by_name(g_ebpf_obj, "select_socket");
-	if (prog == NULL) {
-		SPDK_ERRLOG("Failed to find eBPF program 'select_socket'\n");
-		bpf_object__close(g_ebpf_obj);
-		g_ebpf_obj = NULL;
-		pthread_mutex_unlock(&g_ebpf_lock);
-		return -1;
-	}
-
-	g_ebpf_prog_fd = bpf_program__fd(prog);
-	if (g_ebpf_prog_fd < 0) {
-		SPDK_ERRLOG("Failed to get eBPF program fd\n");
-		bpf_object__close(g_ebpf_obj);
-		g_ebpf_obj = NULL;
-		pthread_mutex_unlock(&g_ebpf_lock);
-		return -1;
-	}
-
-	/* Get the reuseport_array map FD */
-	g_ebpf_map_fd = bpf_object__find_map_fd_by_name(g_ebpf_obj, "reuseport_array");
-	if (g_ebpf_map_fd < 0) {
-		SPDK_ERRLOG("Failed to find 'reuseport_array' map\n");
-		bpf_object__close(g_ebpf_obj);
-		g_ebpf_obj = NULL;
-		g_ebpf_prog_fd = -1;
-		pthread_mutex_unlock(&g_ebpf_lock);
-		return -1;
-	}
-
-	/* Get the config_map FD */
-	g_ebpf_config_map_fd = bpf_object__find_map_fd_by_name(g_ebpf_obj, "config_map");
-	if (g_ebpf_config_map_fd < 0) {
-		SPDK_WARNLOG("Failed to find 'config_map' — num_sockets will default to 4 in eBPF\n");
-		/* Non-fatal: eBPF program falls back to % 4 */
-	}
-
-	SPDK_NOTICELOG("Loaded global eBPF program from '%s' (prog_fd=%d, map_fd=%d)\n",
-		       path, g_ebpf_prog_fd, g_ebpf_map_fd);
-
-	pthread_mutex_unlock(&g_ebpf_lock);
-	return g_ebpf_prog_fd;
-}
 #endif
 
 static int
@@ -491,10 +390,6 @@ udp_sock_listen(const char *ip, int port, struct spdk_sock_opts *opts)
 	struct addrinfo *res, *res0;
 	int fd = -1, rc;
 	int val = 1;
-#ifdef SPDK_CONFIG_EBPF
-	int ebpf_fd = -1;
-	const char *ebpf_path;
-#endif
 
 	if (opts->impl_opts != NULL && opts->impl_opts_size > 0) {
 		memcpy(&impl_opts, &g_udp_impl_opts, sizeof(impl_opts));
@@ -508,17 +403,6 @@ udp_sock_listen(const char *ip, int port, struct spdk_sock_opts *opts)
 	if (!res0) {
 		return NULL;
 	}
-
-#ifdef SPDK_CONFIG_EBPF
-	/* Load eBPF program globally (once) before creating sockets */
-	ebpf_path = getenv("SPDK_UDP_EBPF_PATH");
-	if (ebpf_path != NULL) {
-		ebpf_fd = load_ebpf_program(ebpf_path);
-		if (ebpf_fd < 0) {
-			SPDK_WARNLOG("Failed to load eBPF program, continuing without eBPF\n");
-		}
-	}
-#endif
 
 	/* Try to bind to the first address that works */
 	for (res = res0; res != NULL; res = res->ai_next) {
@@ -570,7 +454,6 @@ udp_sock_listen(const char *ip, int port, struct spdk_sock_opts *opts)
 				     errno, strerror(errno));
 		}
 #endif
-
 		rc = bind(fd, res->ai_addr, res->ai_addrlen);
 		if (rc != 0) {
 			SPDK_ERRLOG("bind() failed: errno=%d (%s)\n", errno, strerror(errno));
@@ -580,107 +463,32 @@ udp_sock_listen(const char *ip, int port, struct spdk_sock_opts *opts)
 		}
 
 #ifdef SPDK_CONFIG_EBPF
-		/* Attach eBPF AFTER bind() succeeds, but only on the FIRST socket */
-		if (ebpf_fd >= 0) {
-			bool should_attach = false;
-			int sock_index = -1;
-			uint32_t current_core;
-			
-			/* Get current reactor core - will be used to index the socket array */
-			current_core = spdk_env_get_current_core();
-			
-			pthread_mutex_lock(&g_ebpf_lock);
-			
-			/* Add this socket FD to the global array at core-based index
-			 * This ensures map[i] always contains socket for core where (core % 4 == i) */
-			if (g_socket_count < MAX_REUSEPORT_SOCKETS) {
-				sock_index = current_core % MAX_REUSEPORT_SOCKETS;
-				if (g_socket_fds[sock_index] != -1) {
-					SPDK_WARNLOG("Socket index %d (core %u) already occupied by FD %d\n",
-						     sock_index, current_core, g_socket_fds[sock_index]);
-				} else {
-					g_socket_fds[sock_index] = fd;
-					g_socket_count++;
-					SPDK_NOTICELOG("Added socket FD %d at index %d for core %u (total: %d)\n",
-						       fd, sock_index, current_core, g_socket_count);
-				}
-			} else {
-				SPDK_WARNLOG("Maximum number of reuseport sockets (%d) reached\n",
-					     MAX_REUSEPORT_SOCKETS);
+		/* Each reactor: write own fd directly to map, attach prog (idempotent), update config */
+		if (impl_opts.ebpf_prog_fd >= 0) {
+			__u32 key = (__u32)impl_opts.ebpf_socket_index;
+
+			rc = bpf_map_update_elem(impl_opts.ebpf_map_fd, &key, &fd, 0);
+			if (rc != 0) {
+				SPDK_ERRLOG("eBPF: map[%u]=%d update failed: errno=%d\n", key, fd, errno);
 			}
-			
-			/* Attach eBPF on first socket and populate map */
-			if (!g_ebpf_attached) {
-				g_ebpf_attached = true;
-				should_attach = true;
+			rc = setsockopt(fd, SOL_SOCKET, SO_ATTACH_REUSEPORT_EBPF,
+					&impl_opts.ebpf_prog_fd, sizeof(impl_opts.ebpf_prog_fd));
+			if (rc != 0) {
+				SPDK_ERRLOG("eBPF: SO_ATTACH_REUSEPORT_EBPF failed: errno=%d (%s)\n",
+					    errno, strerror(errno));
 			}
-			
-			pthread_mutex_unlock(&g_ebpf_lock);
-			
-			if (should_attach) {
-				/* Attach eBPF program to first socket */
-				SPDK_NOTICELOG("Attempting to attach eBPF prog_fd=%d to socket fd=%d via SO_ATTACH_REUSEPORT_EBPF\n",
-					       ebpf_fd, fd);
-				rc = setsockopt(fd, SOL_SOCKET, SO_ATTACH_REUSEPORT_EBPF,
-						&ebpf_fd, sizeof(ebpf_fd));
-				if (rc != 0) {
-					SPDK_ERRLOG("Failed to attach eBPF to first socket fd=%d: errno=%d (%s)\n",
-						    fd, errno, strerror(errno));
-					pthread_mutex_lock(&g_ebpf_lock);
-					g_ebpf_attached = false;  /* Reset on failure */
-					pthread_mutex_unlock(&g_ebpf_lock);
-					/* Don't fail - continue without eBPF */
-				} else {
-					SPDK_NOTICELOG("Attached eBPF program (prog_fd=%d) to FIRST socket (fd=%d)\n",
-						       ebpf_fd, fd);
-				}
-			}
-			
-			/* Populate map after all sockets are created (last socket does this) */
-			if (sock_index >= 0 && g_socket_count == MAX_REUSEPORT_SOCKETS) {
-				pthread_mutex_lock(&g_ebpf_lock);
-				SPDK_NOTICELOG("All %d sockets created, populating eBPF map\n", MAX_REUSEPORT_SOCKETS);
-				for (int i = 0; i < MAX_REUSEPORT_SOCKETS; i++) {
-					__u32 key = i;
-					int sock_fd = g_socket_fds[i];
-					
-					if (sock_fd == -1) {
-						SPDK_WARNLOG("Socket slot %d is empty, skipping\n", i);
-						continue;
-					}
-					
-					rc = bpf_map_update_elem(g_ebpf_map_fd, &key, &sock_fd, 0);
-					if (rc != 0) {
-						SPDK_ERRLOG("Failed to add socket FD %d to map at index %d: %d (errno=%d)\n",
-							    sock_fd, i, rc, errno);
-					} else {
-						SPDK_NOTICELOG("Added socket FD %d to eBPF map at index %d (shard_id %% 4 == %d routes here)\n",
-							       sock_fd, i, i);
-					}
-				}
-				/* Publish num_sockets to config_map so eBPF uses dynamic modulo */
-				if (g_ebpf_config_map_fd >= 0) {
-					__u32 cfg_key = 0;
-					__u32 num_sockets = MAX_REUSEPORT_SOCKETS;
-					rc = bpf_map_update_elem(g_ebpf_config_map_fd, &cfg_key, &num_sockets, 0);
-					if (rc != 0) {
-						SPDK_ERRLOG("Failed to set num_sockets=%u in config_map: errno=%d\n",
-							    num_sockets, errno);
-					} else {
-						SPDK_NOTICELOG("Set num_sockets=%u in eBPF config_map\n", num_sockets);
-					}
-				}
-				pthread_mutex_unlock(&g_ebpf_lock);
+			if (impl_opts.ebpf_config_map_fd >= 0) {
+				__u32 cfg_key = 0;
+				__u32 num = (__u32)impl_opts.ebpf_num_sockets;
+				rc = bpf_map_update_elem(impl_opts.ebpf_config_map_fd, &cfg_key, &num, 0);
 			}
 		}
 #endif
-
 		if (spdk_fd_set_nonblock(fd)) {
 			close(fd);
 			fd = -1;
 			continue;
 		}
-
 		break;
 	}
 

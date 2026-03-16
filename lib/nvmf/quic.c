@@ -39,6 +39,14 @@
 #endif
 #endif /* __linux__ */
 
+#ifdef SPDK_CONFIG_EBPF
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
+#ifndef SPDK_EBPF_REUSEPORT_PATH
+#define SPDK_EBPF_REUSEPORT_PATH ""
+#endif
+#endif
+
 #define MIN_SOCK_PIPE_SIZE 1024
 #define SPDK_NVMF_QUIC_DEFAULT_SOCK_PRIORITY 0
 #define SPDK_NVMF_QUIC_DEFAULT_CONTROL_MSG_NUM 32
@@ -404,6 +412,10 @@ struct spdk_nvmf_quic_poll_group {
 	 * Each poll group has unique thread_id to enable eBPF routing */
 	quicly_cid_plaintext_t			next_cid;
 
+	/* Dense sequential index [0, num_reactors) assigned at creation.
+	 * Used as ebpf_socket_index when creating the SO_REUSEPORT socket. */
+	uint32_t				reactor_idx;
+
 	TAILQ_ENTRY(spdk_nvmf_quic_poll_group)	link;
 };
 
@@ -455,6 +467,14 @@ struct spdk_nvmf_quic_transport {
 
 	/* Counter for assigning unique thread_ids to poll groups (for eBPF routing) */
 	uint32_t				next_thread_id;
+
+#ifdef SPDK_CONFIG_EBPF
+	/* eBPF SO_REUSEPORT state - loaded once in nvmf_quic_listen, shared by all reactors */
+	struct bpf_object			*ebpf_obj;
+	int					ebpf_prog_fd;
+	int					ebpf_map_fd;
+	int					ebpf_config_map_fd;
+#endif
 
 	struct spdk_poller			*accept_poller;
 	struct spdk_sock_group			*listen_sock_group;
@@ -2728,19 +2748,29 @@ nvmf_quic_poll_group_add_port(void *ctx)
 	opts.priority = qtransport->quic_opts.sock_priority;
 	opts.ack_timeout = qtransport->transport.opts.ack_timeout;
 
-	if (port->sock_impl_name) {
-		spdk_sock_impl_get_opts(port->sock_impl_name, &impl_opts, &impl_opts_size);
+	/* Always populate impl_opts so eBPF fields can be set below */
+	spdk_sock_impl_get_opts(port->sock_impl_name ? port->sock_impl_name : "udp",
+				&impl_opts, &impl_opts_size);
 
-		if (port->secure_channel && !strncmp("ssl", port->sock_impl_name, 3)) {
-			impl_opts.tls_version = SPDK_TLS_VERSION_1_3;
-			impl_opts.get_key = quic_sock_get_key;
-			impl_opts.get_key_ctx = qtransport;
-			impl_opts.tls_cipher_suites = "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256";
-		}
-
-		opts.impl_opts = &impl_opts;
-		opts.impl_opts_size = sizeof(impl_opts);
+	if (port->sock_impl_name && port->secure_channel &&
+	    !strncmp("ssl", port->sock_impl_name, 3)) {
+		impl_opts.tls_version = SPDK_TLS_VERSION_1_3;
+		impl_opts.get_key = quic_sock_get_key;
+		impl_opts.get_key_ctx = qtransport;
+		impl_opts.tls_cipher_suites = "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256";
 	}
+
+#ifdef SPDK_CONFIG_EBPF
+	/* Pass pre-loaded fds — no path needed, loading already done in nvmf_quic_listen() */
+	impl_opts.ebpf_prog_fd       = qtransport->ebpf_prog_fd;
+	impl_opts.ebpf_map_fd        = qtransport->ebpf_map_fd;
+	impl_opts.ebpf_config_map_fd = qtransport->ebpf_config_map_fd;
+	impl_opts.ebpf_socket_index  = (int)qgroup->reactor_idx;
+	impl_opts.ebpf_num_sockets   = (int)spdk_env_get_core_count();
+#endif
+
+	opts.impl_opts = &impl_opts;
+	opts.impl_opts_size = sizeof(impl_opts);
 
 
 	/* Create UDP socket with SO_REUSEPORT for this reactor */
@@ -2753,8 +2783,6 @@ nvmf_quic_poll_group_add_port(void *ctx)
 	}
 
 	/* Register socket to the transport's listen_sock_group (polled by nvmf_quic_accept) */
-	SPDK_DEBUGLOG(nvmf,"Adding UDP socket %p to qtransport->listen_sock_group=%p on reactor %u\n",
-	              udp_sock, qtransport->listen_sock_group, spdk_env_get_current_core());
 	rc = spdk_sock_group_add_sock(qgroup->sock_group, udp_sock,
 				      nvmf_quic_datagram_cb, qgroup);
 	if (rc < 0) {
@@ -2767,6 +2795,67 @@ nvmf_quic_poll_group_add_port(void *ctx)
 	SPDK_DEBUGLOG(nvmf,"Created UDP socket for %s:%s on reactor %u\n",
 		      port->trid->traddr, port->trid->trsvcid, spdk_env_get_current_core());
 }
+
+#ifdef SPDK_CONFIG_EBPF
+static void
+nvmf_quic_load_ebpf(struct spdk_nvmf_quic_transport *qtransport)
+{
+	struct bpf_object *obj;
+	struct bpf_program *prog;
+	int rc;
+
+	if (qtransport->ebpf_prog_fd >= 0) {
+		return;  /* already loaded */
+	}
+
+	obj = bpf_object__open_file(SPDK_EBPF_REUSEPORT_PATH, NULL);
+	if (obj == NULL) {
+		SPDK_ERRLOG("eBPF: failed to open '%s'\n", SPDK_EBPF_REUSEPORT_PATH);
+		return;
+	}
+
+	rc = bpf_object__load(obj);
+	if (rc != 0) {
+		SPDK_ERRLOG("eBPF: failed to load object: %d\n", rc);
+		bpf_object__close(obj);
+		return;
+	}
+
+	prog = bpf_object__find_program_by_name(obj, "select_socket");
+	if (prog == NULL) {
+		SPDK_ERRLOG("eBPF: program 'select_socket' not found\n");
+		bpf_object__close(obj);
+		return;
+	}
+
+	qtransport->ebpf_prog_fd = bpf_program__fd(prog);
+	if (qtransport->ebpf_prog_fd < 0) {
+		SPDK_ERRLOG("eBPF: failed to get program fd\n");
+		bpf_object__close(obj);
+		qtransport->ebpf_prog_fd = -1;
+		return;
+	}
+
+	qtransport->ebpf_map_fd = bpf_object__find_map_fd_by_name(obj, "reuseport_array");
+	if (qtransport->ebpf_map_fd < 0) {
+		SPDK_ERRLOG("eBPF: 'reuseport_array' map not found\n");
+		bpf_object__close(obj);
+		qtransport->ebpf_prog_fd = -1;
+		qtransport->ebpf_map_fd = -1;
+		return;
+	}
+
+	qtransport->ebpf_config_map_fd = bpf_object__find_map_fd_by_name(obj, "config_map");
+	if (qtransport->ebpf_config_map_fd < 0) {
+		SPDK_WARNLOG("eBPF: 'config_map' not found — num_sockets will default in eBPF\n");
+	}
+
+	qtransport->ebpf_obj = obj;
+	SPDK_NOTICELOG("eBPF: loaded '%s' prog_fd=%d map_fd=%d\n",
+		       SPDK_EBPF_REUSEPORT_PATH,
+		       qtransport->ebpf_prog_fd, qtransport->ebpf_map_fd);
+}
+#endif
 
 static int
 nvmf_quic_listen(struct spdk_nvmf_transport *transport, const struct spdk_nvme_transport_id *trid,
@@ -2785,6 +2874,11 @@ nvmf_quic_listen(struct spdk_nvmf_transport *transport, const struct spdk_nvme_t
 	}
 	
 	qtransport = SPDK_CONTAINEROF(transport, struct spdk_nvmf_quic_transport, transport);
+
+#ifdef SPDK_CONFIG_EBPF
+	/* Load eBPF once per transport (idempotent — stays a no-op on subsequent listen calls) */
+	nvmf_quic_load_ebpf(qtransport);
+#endif
 
 	/* Validate port number */
 	trsvcid_int = nvmf_quic_trsvcid_to_int(trid->trsvcid);
@@ -3233,6 +3327,14 @@ nvmf_quic_create(struct spdk_nvmf_transport_opts *opts)
 	/* Initialize thread_id counter for poll groups (for eBPF routing) */
 	qtransport->next_thread_id = 0;
 
+#ifdef SPDK_CONFIG_EBPF
+	/* Initialize eBPF state - loaded lazily on first nvmf_quic_listen() call */
+	qtransport->ebpf_obj = NULL;
+	qtransport->ebpf_prog_fd = -1;
+	qtransport->ebpf_map_fd = -1;
+	qtransport->ebpf_config_map_fd = -1;
+#endif
+
 	qtransport->recv_buf = calloc(1, sizeof(struct spdk_udp_recv_batch));
 	if (!qtransport->recv_buf) {
 		SPDK_ERRLOG("failed to allocate recv_buf for qid %u\n");
@@ -3300,6 +3402,16 @@ nvmf_quic_destroy(struct spdk_nvmf_transport *transport,
 	spdk_poller_unregister(&qtransport->accept_poller);
 	spdk_sock_group_unregister_interrupt(qtransport->listen_sock_group);
 	spdk_sock_group_close(&qtransport->listen_sock_group);
+
+#ifdef SPDK_CONFIG_EBPF
+	if (qtransport->ebpf_obj != NULL) {
+		bpf_object__close(qtransport->ebpf_obj);
+		qtransport->ebpf_obj = NULL;
+		qtransport->ebpf_prog_fd = -1;
+		qtransport->ebpf_map_fd = -1;
+		qtransport->ebpf_config_map_fd = -1;
+	}
+#endif
 
 	/* Free plaintext CID encryptor */
 	if (qtransport->quic_ctx && qtransport->quic_ctx->cid_encryptor) {
@@ -3759,7 +3871,8 @@ nvmf_quic_poll_group_create(struct spdk_nvmf_transport *transport, struct spdk_n
 	 * This enables eBPF to route packets back to correct socket */
 	qgroup->next_cid.master_id = 0;
 	qgroup->next_cid.path_id = 0;
-	qgroup->next_cid.thread_id = 0;  /* Assign unique ID: 0, 1, 2, 3... */
+	qgroup->reactor_idx = qtransport->next_thread_id++;
+	qgroup->next_cid.thread_id = qgroup->reactor_idx;
 	qgroup->next_cid.node_id = 0;
 	
 	/* One-time init of the recv batch: sets up iov/name/cmsg pointers that never change.

@@ -17,6 +17,12 @@ C_SRCS-$(CONFIG_RDMA) += rdma.c
 C_SRCS-$(CONFIG_HAVE_EVP_MAC) += auth.c
 C_SRCS-$(CONFIG_QUIC) += quic.c
 
+ifeq ($(CONFIG_EBPF),y)
+CFLAGS += -DSPDK_CONFIG_EBPF
+CFLAGS += -DSPDK_EBPF_REUSEPORT_PATH=\"$(SPDK_ROOT_DIR)/module/sock/udp/ebpf/reuseport_kern.o\"
+LOCAL_SYS_LIBS += -lbpf
+endif
+
 LIBNAME = nvmf
 LOCAL_SYS_LIBS =
 ifeq ($(CONFIG_RDMA),y)
