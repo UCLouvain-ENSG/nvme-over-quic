@@ -396,12 +396,23 @@ spdk_sock_writev_direct(struct spdk_sock *sock,
 	return sock->net_impl->writev_direct(sock, iovs, iovcnt, addr, addrlen);
 }
 
-size_t
-spdk_sock_recv_with_msghdr(struct spdk_sock *sock,
-			    void *buf, size_t len,
-			    struct msghdr *msg)
+int
+spdk_sock_writev_direct_batch(struct spdk_sock *sock, struct mmsghdr *msgs, int n)
 {
-	return sock->net_impl->recv_with_msghdr(sock, buf, len, msg);
+	return sock->net_impl->writev_direct_batch(sock, msgs, n);
+}
+
+int
+spdk_sock_writev_direct_gso(struct spdk_sock *sock, struct iovec *iov, size_t segment_size,
+			    struct sockaddr *addr, socklen_t addrlen)
+{
+	return sock->net_impl->writev_direct_gso(sock, iov, segment_size, addr, addrlen);
+}
+
+int
+spdk_sock_recv_with_msghdr(struct spdk_sock *sock, struct mmsghdr *msgs, int vlen)
+{
+        return sock->net_impl->recv_with_msghdr(sock, msgs, vlen);
 }
 
 

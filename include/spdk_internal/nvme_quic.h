@@ -36,8 +36,18 @@
 #define SPDK_NVME_QUIC_DIGEST_ALIGNMENT		4
 #define SPDK_NVME_QUIC_QPAIR_EXIT_TIMEOUT	30
 #define SPDK_NVMF_QUIC_RECV_BUF_SIZE_FACTOR	8
-#define SPDK_NVME_QUIC_IN_CAPSULE_DATA_MAX_SIZE	8192u
+#define SPDK_NVME_QUIC_IN_CAPSULE_DATA_MAX_SIZE	4096u
+
 #define SPDK_NVME_QUIC_MAX_UDP_DATAGRAM_SIZE		1472u
+#define SPDK_NVME_QUIC_MAX_SEND_PACKETS		32u
+
+
+#define UDP_RECV_BATCH_SIZE     64
+/* Each recv slot must be large enough to hold a full UDP GRO super-segment.
+ * The kernel coalesces up to 64KB, so allocate that much per slot. */
+#define UDP_RECV_BATCH_BUF_SIZE (64 * 1024)
+/* Space for the UDP_GRO cmsg (gso_size) returned per slot */
+#define UDP_RECV_CMSG_SIZE      CMSG_SPACE(sizeof(uint16_t))
 
 /*
  * Maximum number of SGL elements.
@@ -137,42 +147,70 @@ struct spdk_nvmf_quic_sendbuf_element_t {
 };
 
 
+struct spdk_udp_recv_batch {
+	uint8_t                 bufs[UDP_RECV_BATCH_SIZE][UDP_RECV_BATCH_BUF_SIZE];
+	struct iovec            iovecs[UDP_RECV_BATCH_SIZE];
+	struct sockaddr_storage addrs[UDP_RECV_BATCH_SIZE];
+	/* per-slot cmsg buffer to receive UDP_GRO gso_size annotation */
+	uint8_t                 cmsgs[UDP_RECV_BATCH_SIZE][UDP_RECV_CMSG_SIZE];
+	struct mmsghdr          msgs[UDP_RECV_BATCH_SIZE];
+};
+
+/* Initialise all iov/name pointers inside a batch so they're ready to pass to recvmmsg. */
+static inline void
+nvme_quic_recv_batch_init(struct spdk_udp_recv_batch *b)
+{
+	int i;
+	for (i = 0; i < UDP_RECV_BATCH_SIZE; i++) {
+			b->iovecs[i].iov_base            = b->bufs[i];
+			b->iovecs[i].iov_len             = UDP_RECV_BATCH_BUF_SIZE;
+			b->msgs[i].msg_hdr.msg_iov       = &b->iovecs[i];
+			b->msgs[i].msg_hdr.msg_iovlen    = 1;
+			b->msgs[i].msg_hdr.msg_name      = &b->addrs[i];
+			b->msgs[i].msg_hdr.msg_namelen   = sizeof(b->addrs[i]);
+			/* Provide cmsg buffer so kernel can write UDP_GRO gso_size */
+			b->msgs[i].msg_hdr.msg_control   = b->cmsgs[i];
+			b->msgs[i].msg_hdr.msg_controllen = UDP_RECV_CMSG_SIZE;
+			b->msgs[i].msg_hdr.msg_flags     = 0;
+	}
+}
+
 struct nvme_quic_stream {
 	/* For containerof pattern of streambuf */
 	quicly_streambuf_t			streambuf;
 
-	/* QUIC stream pointer - stream->data points back to nvme_quic_req */
+	/* QUIC stream pointer - stream->data points back to nvme_quic_stream */
 	quicly_stream_t				*quic_stream;
 
 	void	(*cb_fn)(void *cb_arg);
 	void					*cb_arg;
-	
 
-	quicly_sendbuf_vec_t		cmd_buf;
-	quicly_sendbuf_vec_t		rsp_buf;
-	quicly_sendbuf_vec_t		r2t_buf;
+	/*
+	 * Two send vecs cover all cases on both sides:
+	 *   client:  hdr_buf = NVMe command (64B), data_buf = in-capsule / H2C data
+	 *   server:  hdr_buf = NVMe completion (16B) or R2T PDU (8B, never simultaneous),
+	 *            data_buf = C2H data
+	 * rsp_buf and r2t_buf were removed; they share hdr_buf since they are never
+	 * simultaneously live in quicly's sendbuf queue.
+	 */
+	quicly_sendbuf_vec_t		hdr_buf;
+	quicly_sendbuf_vec_t		data_buf;
 
-	/* Separate elements for cmd and data to avoid overwriting each other */
-	struct spdk_nvmf_quic_sendbuf_element_t cmd_element;
+	/* Callback elements — one per live send vec */
+	struct spdk_nvmf_quic_sendbuf_element_t hdr_element;
 	struct spdk_nvmf_quic_sendbuf_element_t data_element;
-
-	/* To avoid one copy for send point. */
-	quicly_sendbuf_vec_t				data_buf;
-
-
-	// struct iovec					data_iov[NVME_QUIC_MAX_SGL_DESCRIPTORS];
-	// uint32_t					data_iovcnt;
-	// uint32_t					data_len;
 
 	uint32_t					rw_offset;
 
 	/* Receive state */
 	enum nvme_quic_stream_recv_state	recv_state;
 
-	void						*req; /* data tied to a tcp request */
-	void						*qpair;
+	void						*req;   /* nvme_quic_req* or nvmf_quic_req* */
+	void						*qpair; /* owning nvme_quic_qpair* (persists for stream lifetime) */
 
-	SLIST_ENTRY(nvme_quic_stream)			slist;
+	/* Free-list linkage — used by target-side (nvmf/quic.c) stream pool.
+	 * Not used by client-side (lib/nvme/nvme_quic.c) since streams are embedded in reqs. */
+	TAILQ_ENTRY(nvme_quic_stream)		stream_link;
 };
 
 /* Ensure data_buf array is properly aligned for efficient I/O operations */
@@ -295,12 +333,10 @@ nvme_quic_read_data(struct spdk_sock *sock, int bytes,
 
 
 static int
-nvme_quic_read_data_with_msghdr(struct spdk_sock *sock, int bytes,
-		   void *buf, struct msghdr *msg)
+nvme_quic_read_data_with_msghdr(struct spdk_sock *sock, struct mmsghdr *msgs, int vlen)
 {
-	return spdk_sock_recv_with_msghdr(sock, buf, bytes, msg);
+    return spdk_sock_recv_with_msghdr(sock, msgs, vlen);
 }
-
 
 
 static int
@@ -355,16 +391,16 @@ nvme_quic_stream_set_data_buf(struct nvme_quic_stream *stream,
 
 static void
 nvme_quic_stream_set_cmd_buf(struct nvme_quic_stream *stream,
-			 struct spdk_nvme_cmd *cmd, 
+			 struct spdk_nvme_cmd *cmd,
 			 quicly_streambuf_sendvec_callbacks_t *cb)
 {
-	stream->cmd_buf.cb = cb;
-	stream->cmd_buf.len = 64; /* NVMe command size */
+	stream->hdr_buf.cb = cb;
+	stream->hdr_buf.len = 64; /* NVMe command size */
 
-	stream->cmd_element.buf = cmd;
-	stream->cmd_element.nvme_stream = stream;
+	stream->hdr_element.buf = cmd;
+	stream->hdr_element.nvme_stream = stream;
 
-	stream->cmd_buf.cbdata = &stream->cmd_element;
+	stream->hdr_buf.cbdata = &stream->hdr_element;
 }
 
 static void
@@ -372,14 +408,13 @@ nvme_quic_stream_set_rsp_buf(struct nvme_quic_stream *stream,
 			 struct spdk_nvme_cpl *rsp,
 			 quicly_streambuf_sendvec_callbacks_t *cb)
 {
-	stream->rsp_buf.cb = cb;
-	stream->rsp_buf.len = 16; /* NVMe completion size */
-	/* Store stream pointer in cbdata so discard callback can find the request */
+	stream->hdr_buf.cb = cb;
+	stream->hdr_buf.len = 16; /* NVMe completion size */
 
-	stream->cmd_element.buf = rsp;
-	stream->cmd_element.nvme_stream = stream;
+	stream->hdr_element.buf = rsp;
+	stream->hdr_element.nvme_stream = stream;
 
-	stream->rsp_buf.cbdata = &stream->cmd_element;
+	stream->hdr_buf.cbdata = &stream->hdr_element;
 }
 
 static void
@@ -387,14 +422,14 @@ nvme_quic_stream_set_r2t_buf(struct nvme_quic_stream *stream,
 			 struct spdk_nvme_quic_r2t *r2t,
 			 quicly_streambuf_sendvec_callbacks_t *cb)
 {
-	stream->r2t_buf.cb = cb;
-	stream->r2t_buf.len = sizeof(struct spdk_nvme_quic_r2t);
-	
-	/* Use data_element structure for R2T (data-related) */
-	stream->data_element.buf = r2t;
-	stream->data_element.nvme_stream = stream;
-	
-	stream->r2t_buf.cbdata = &stream->data_element;
+	/* R2T and RSP (rsp_buf) are never simultaneously live — both reuse hdr_buf */
+	stream->hdr_buf.cb = cb;
+	stream->hdr_buf.len = sizeof(struct spdk_nvme_quic_r2t);
+
+	stream->hdr_element.buf = r2t;
+	stream->hdr_element.nvme_stream = stream;
+
+	stream->hdr_buf.cbdata = &stream->hdr_element;
 }
 
 

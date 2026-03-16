@@ -976,6 +976,7 @@ nvme_tcp_qpair_capsule_cmd_send(struct nvme_tcp_qpair *tqpair,
 	capsule_cmd->ccsqe = tcp_req->req->cmd;
 
 	NVME_TQPAIR_DEBUGLOG(tqpair, "capsule_cmd cid=%u\n", tcp_req->req->cmd.cid);
+	SPDK_DEBUGLOG(nvme_tcp, "capsule_cmd opc=%u cid=%u\n", tcp_req->req->cmd.opc, tcp_req->req->cmd.cid);
 
 	if (tqpair->flags.host_hdgst_enable) {
 		NVME_TQPAIR_DEBUGLOG(tqpair, "Header digest is enabled for capsule command on tcp_req=%p\n",
@@ -1115,6 +1116,8 @@ nvme_tcp_req_complete(struct nvme_tcp_req *tcp_req,
 
 	nvme_tcp_req_put(tqpair, tcp_req);
 	nvme_complete_request(req->cb_fn, req->cb_arg, req->qpair, req, &cpl);
+
+	SPDK_DEBUGLOG(nvme_tcp, "tcp_req opc=%u cid=%u completed\n", req->cmd.opc, req->cmd.cid);
 }
 
 static void
@@ -2081,6 +2084,13 @@ nvme_tcp_read_pdu(struct nvme_tcp_qpair *tqpair, uint32_t *reaped, uint32_t max_
 				break;
 			}
 
+			// /* Dummy copy to a throwaway sink — measures copy overhead only */
+			// if (rc > 0 && pdu->data_iov[0].iov_base != NULL) {
+			// 	static char _dummy_copy_sink[NVME_TCP_RW_BUFFER_SIZE];
+			// 	memcpy(_dummy_copy_sink, pdu->data_iov[0].iov_base,
+			// 	       spdk_min((size_t)rc, sizeof(_dummy_copy_sink)));
+			// }
+
 			pdu->rw_offset += rc;
 			if (pdu->rw_offset < data_len) {
 				return NVME_TCP_PDU_IN_PROGRESS;
@@ -2181,6 +2191,7 @@ nvme_tcp_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_c
 			goto fail;
 		}
 	}
+
 
 	if (max_completions == 0) {
 		max_completions = spdk_max(tqpair->num_entries, 1);
@@ -2903,9 +2914,11 @@ nvme_tcp_poll_group_process_completions(struct spdk_nvme_transport_poll_group *t
 	group->num_completions = 0;
 	group->stats.polls++;
 
-	SPDK_NOTICELOG("[TIMING] BEFORE spdk_sock_group_poll()\n");
+	SPDK_DEBUGLOG(nvme_tcp, "New poll cycle: completions_per_qpair=%u\n", completions_per_qpair);
+
+	//SPDK_NOTICELOG("[TIMING] BEFORE spdk_sock_group_poll()\n");
 	num_events = spdk_sock_group_poll(group->sock_group);
-	SPDK_NOTICELOG("[TIMING] AFTER spdk_sock_group_poll() returned %d events\n", num_events);
+	//SPDK_NOTICELOG("[TIMING] AFTER spdk_sock_group_poll() returned %d events\n", num_events);
 
 
 	STAILQ_FOREACH_SAFE(qpair, &tgroup->disconnected_qpairs, poll_group_stailq, tmp_qpair) {
@@ -3106,3 +3119,5 @@ nvme_tcp_trace(void)
 	spdk_trace_tpoint_register_relation(TRACE_SOCK_REQ_COMPLETE, OBJECT_NVME_TCP_REQ, 0);
 }
 SPDK_TRACE_REGISTER_FN(nvme_tcp_trace, "nvme_tcp", TRACE_GROUP_NVME_TCP)
+SPDK_LOG_REGISTER_COMPONENT(nvme_tcp)
+SPDK_LOG_REGISTER_COMPONENT(nvme_tcp_recv)

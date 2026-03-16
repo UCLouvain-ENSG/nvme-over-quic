@@ -71,24 +71,25 @@ udp_getaddrinfo(const char *ip, int port)
 #define MIN_SO_RCVBUF_SIZE (256 * 1024)
 #define MIN_SO_SNDBUF_SIZE (256 * 1024)
 
+/* recvmmsg() batch receive: drain up to 32 UDP datagrams per syscall */
+#define UDP_RECV_BATCH_SIZE     64
+#define UDP_RECV_BATCH_BUF_SIZE 2048  /* >= quicly default max_udp_payload_size (1472) */
+
 struct  spdk_udp_sock {
 	struct spdk_sock	base;
 	int			fd;
 
-	struct spdk_pipe	*recv_pipe;
-	
+	/* Local address cached once at socket creation to avoid getsockname() on every packet */
+	struct sockaddr_storage	cached_local_addr;
+	socklen_t		cached_local_addr_len;
+
 	/* Remote address for connected UDP sockets */
 	struct sockaddr_storage	remote_addr;
 	socklen_t		remote_addr_len;
 	bool			is_connected;
-	bool			pipe_has_data;
-	bool			socket_has_data;
 	bool			zcopy;
 	bool			ready;
 
-	int			recv_buf_sz;
-
-	
 	int			placement_id;
 
 	TAILQ_ENTRY(spdk_udp_sock)	link;
@@ -96,15 +97,11 @@ struct  spdk_udp_sock {
 	char			interface_name[IFNAMSIZ];
 };
 
-TAILQ_HEAD(spdk_has_data_list, spdk_udp_sock);
-
 struct spdk_udp_sock_group_impl {
 	struct spdk_sock_group_impl	base;
 	int				fd;
 	struct spdk_interrupt		*intr;
-	struct spdk_has_data_list	socks_with_data;
 	int				placement_id;
-	struct spdk_pipe_group		*pipe_group;
 };
 
 
@@ -126,6 +123,7 @@ static struct spdk_sock_impl_opts g_udp_impl_opts = {
 static struct bpf_object *g_ebpf_obj = NULL;
 static int g_ebpf_prog_fd = -1;
 static int g_ebpf_map_fd = -1;
+static int g_ebpf_config_map_fd = -1;  /* config_map: key=0 → num_sockets */
 static bool g_ebpf_attached = false;
 static pthread_mutex_t g_ebpf_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -162,6 +160,18 @@ udp_sock_map_cleanup(void)
 
 #define __udp_sock(sock) (struct spdk_udp_sock *)sock
 #define __udp_group_impl(group) (struct spdk_udp_sock_group_impl *)group
+
+#ifdef __linux__
+#ifndef UDP_SEGMENT
+#define UDP_SEGMENT 103
+#endif
+#ifndef UDP_GRO
+#define UDP_GRO 104
+#endif
+#ifndef SOL_UDP
+#define SOL_UDP 17
+#endif
+#endif /* __linux__ */
 
 #ifdef SPDK_CONFIG_EBPF
 #ifndef SO_ATTACH_REUSEPORT_EBPF
@@ -228,6 +238,13 @@ load_ebpf_program(const char *path)
 		return -1;
 	}
 
+	/* Get the config_map FD */
+	g_ebpf_config_map_fd = bpf_object__find_map_fd_by_name(g_ebpf_obj, "config_map");
+	if (g_ebpf_config_map_fd < 0) {
+		SPDK_WARNLOG("Failed to find 'config_map' — num_sockets will default to 4 in eBPF\n");
+		/* Non-fatal: eBPF program falls back to % 4 */
+	}
+
 	SPDK_NOTICELOG("Loaded global eBPF program from '%s' (prog_fd=%d, map_fd=%d)\n",
 		       path, g_ebpf_prog_fd, g_ebpf_map_fd);
 
@@ -245,33 +262,43 @@ udp_sock_getaddr(struct spdk_sock *_sock, char *saddr, int slen, uint16_t *sport
 	socklen_t local_len = sizeof(local_addr);
 	int rc;
 
-	/* Get local address using getsockname (works for UDP) */
+	/* Use cached local address — populated once at socket creation */
 	if (saddr != NULL || sport != NULL) {
-		rc = getsockname(sock->fd, (struct sockaddr *)&local_addr, &local_len);
-		if (rc != 0) {
-			return -1;
+		const struct sockaddr_storage *la;
+
+		if (sock->cached_local_addr.ss_family != 0) {
+			la = &sock->cached_local_addr;
+		} else {
+			/* Fallback: cache was not populated at alloc time (shouldn't happen) */
+			rc = getsockname(sock->fd, (struct sockaddr *)&local_addr, &local_len);
+			if (rc != 0) {
+				return -1;
+			}
+			/* Populate cache for future calls */
+			sock->cached_local_addr = local_addr;
+			sock->cached_local_addr_len = local_len;
+			la = &sock->cached_local_addr;
 		}
 
 		if (saddr != NULL) {
-			if (local_addr.ss_family == AF_INET) {
-				struct sockaddr_in *addr_in = (struct sockaddr_in *)&local_addr;
+			if (la->ss_family == AF_INET) {
+				const struct sockaddr_in *addr_in = (const struct sockaddr_in *)la;
 				inet_ntop(AF_INET, &addr_in->sin_addr, saddr, slen);
-			} else if (local_addr.ss_family == AF_INET6) {
-				struct sockaddr_in6 *addr_in6 = (struct sockaddr_in6 *)&local_addr;
+			} else if (la->ss_family == AF_INET6) {
+				const struct sockaddr_in6 *addr_in6 = (const struct sockaddr_in6 *)la;
 				inet_ntop(AF_INET6, &addr_in6->sin6_addr, saddr, slen);
 			}
 		}
 
 		if (sport != NULL) {
-			if (local_addr.ss_family == AF_INET) {
-				struct sockaddr_in *addr_in = (struct sockaddr_in *)&local_addr;
+			if (la->ss_family == AF_INET) {
+				const struct sockaddr_in *addr_in = (const struct sockaddr_in *)la;
 				*sport = ntohs(addr_in->sin_port);
-				/* Debug: Log what getsockname returns */
-				SPDK_DEBUGLOG(sock_udp, "UDP getsockname returned port %u for fd %d\n", *sport, sock->fd);
-			} else if (local_addr.ss_family == AF_INET6) {
-				struct sockaddr_in6 *addr_in6 = (struct sockaddr_in6 *)&local_addr;
+				SPDK_DEBUGLOG(sock_udp, "UDP cached local port %u for fd %d\n", *sport, sock->fd);
+			} else if (la->ss_family == AF_INET6) {
+				const struct sockaddr_in6 *addr_in6 = (const struct sockaddr_in6 *)la;
 				*sport = ntohs(addr_in6->sin6_port);
-				SPDK_DEBUGLOG(sock_udp, "UDP getsockname returned port %u for fd %d\n", *sport, sock->fd);
+				SPDK_DEBUGLOG(sock_udp, "UDP cached local port %u for fd %d\n", *sport, sock->fd);
 			}
 		}
 	}
@@ -434,7 +461,16 @@ udp_sock_alloc(int fd, struct spdk_sock_impl_opts *impl_opts)
 
 	sock->fd = fd;
 	memcpy(&sock->base.impl_opts, impl_opts, sizeof(*impl_opts));
-	
+
+	/* Cache local address once — avoids getsockname() on every recvmsg/getaddr call */
+	sock->cached_local_addr_len = sizeof(sock->cached_local_addr);
+	if (getsockname(fd, (struct sockaddr *)&sock->cached_local_addr,
+			&sock->cached_local_addr_len) != 0) {
+		/* Non-fatal: zero out so udp_sock_getaddr falls back to live call */
+		memset(&sock->cached_local_addr, 0, sizeof(sock->cached_local_addr));
+		sock->cached_local_addr_len = 0;
+	}
+
 #if defined(__linux__)
 	spdk_sock_get_placement_id(sock->fd, sock->base.impl_opts.enable_placement_id,
 				   &sock->placement_id);
@@ -524,7 +560,17 @@ udp_sock_listen(const char *ip, int port, struct spdk_sock_opts *opts)
 			continue;
 		}
 
-	
+#ifdef UDP_GRO
+		/* Enable UDP GRO so the kernel coalesces equal-size incoming datagrams
+		 * into a super-segment before delivery, matching TCP GRO behavior. */
+		val = 1;
+		rc = setsockopt(fd, SOL_UDP, UDP_GRO, &val, sizeof(val));
+		if (rc != 0) {
+			SPDK_WARNLOG("setsockopt(UDP_GRO) failed: errno=%d (%s) — GRO disabled\n",
+				     errno, strerror(errno));
+		}
+#endif
+
 		rc = bind(fd, res->ai_addr, res->ai_addrlen);
 		if (rc != 0) {
 			SPDK_ERRLOG("bind() failed: errno=%d (%s)\n", errno, strerror(errno));
@@ -612,6 +658,18 @@ udp_sock_listen(const char *ip, int port, struct spdk_sock_opts *opts)
 							       sock_fd, i, i);
 					}
 				}
+				/* Publish num_sockets to config_map so eBPF uses dynamic modulo */
+				if (g_ebpf_config_map_fd >= 0) {
+					__u32 cfg_key = 0;
+					__u32 num_sockets = MAX_REUSEPORT_SOCKETS;
+					rc = bpf_map_update_elem(g_ebpf_config_map_fd, &cfg_key, &num_sockets, 0);
+					if (rc != 0) {
+						SPDK_ERRLOG("Failed to set num_sockets=%u in config_map: errno=%d\n",
+							    num_sockets, errno);
+					} else {
+						SPDK_NOTICELOG("Set num_sockets=%u in eBPF config_map\n", num_sockets);
+					}
+				}
 				pthread_mutex_unlock(&g_ebpf_lock);
 			}
 		}
@@ -687,6 +745,17 @@ udp_sock_connect(const char *ip, int port, struct spdk_sock_opts *opts)
 			fd = -1;
 			continue;
 		}
+
+#ifdef UDP_GRO
+		/* Enable UDP GRO so the kernel coalesces equal-size incoming datagrams
+		 * into a super-segment before delivery, matching TCP GRO behavior. */
+		val = 1;
+		rc = setsockopt(fd, SOL_UDP, UDP_GRO, &val, sizeof(val));
+		if (rc != 0) {
+			SPDK_WARNLOG("setsockopt(UDP_GRO) failed: errno=%d (%s) — GRO disabled\n",
+				     errno, strerror(errno));
+		}
+#endif
 
 		/* Optional: bind to source address if specified */
 		if (opts->src_addr != NULL || opts->src_port != 0) {
@@ -944,7 +1013,14 @@ udp_sock_group_impl_get_optimal(struct spdk_sock *_sock, struct spdk_sock_group_
 }
 
 static int
-udp_sock_alloc_pipe(struct spdk_udp_sock *sock, int sz)
+udp_sock_alloc_pipe(struct spdk_udp_sock *sock __attribute__((unused)), int sz __attribute__((unused)))
+{
+	return 0;
+}
+
+#if 0
+static int
+udp_sock_alloc_pipe_unused(struct spdk_udp_sock *sock, int sz)
 {
 	uint8_t *new_buf, *old_buf;
 	struct spdk_pipe *new_pipe;
@@ -1016,6 +1092,7 @@ udp_sock_alloc_pipe(struct spdk_udp_sock *sock, int sz)
 
 	return 0;
 }
+#endif
 
 
 
@@ -1042,17 +1119,7 @@ udp_sock_group_impl_create(void)
 	}
 
 
-	group_impl->pipe_group = spdk_pipe_group_create();
-	if (group_impl->pipe_group == NULL) {
-		SPDK_ERRLOG("pipe_group allocation failed\n");
-		free(group_impl);
-		close(fd);
-		return NULL;
-	}
-
-
 	group_impl->fd = fd;
-	TAILQ_INIT(&group_impl->socks_with_data);
 	group_impl->placement_id = -1;
 
 	if (g_udp_impl_opts.enable_placement_id == PLACEMENT_CPU) {
@@ -1153,17 +1220,6 @@ udp_sock_group_impl_add_sock(struct spdk_sock_group_impl *_group, struct spdk_so
 		return -1;
 	}
 
-	/* switched from another polling group due to scheduling */
-	if (spdk_unlikely(sock->recv_pipe != NULL  &&
-			  (spdk_pipe_reader_bytes_available(sock->recv_pipe) > 0))) {
-		sock->pipe_has_data = true;
-		sock->socket_has_data = false;
-		TAILQ_INSERT_TAIL(&group->socks_with_data, sock, link);
-	} else if (sock->recv_pipe != NULL) {
-		rc = spdk_pipe_group_add(group->pipe_group, sock->recv_pipe);
-		assert(rc == 0);
-	}
-
 	if (_sock->impl_opts.enable_placement_id == PLACEMENT_MARK) {
 		udp_sock_update_mark(_group, _sock);
 	} else if (sock->placement_id != -1) {
@@ -1212,9 +1268,9 @@ udp_sock_group_impl_poll(struct spdk_sock_group_impl *_group, int max_events,
 			   struct spdk_sock **socks)
 {
 	struct spdk_udp_sock_group_impl *group = __udp_group_impl(_group);
-	struct spdk_sock *sock, *tmp;
-	int num_events, i, rc;
-	struct spdk_udp_sock *usock, *utmp;
+	struct spdk_sock *sock;
+	struct spdk_udp_sock *usock;
+	int num_events, ready, i;
 #if defined(SPDK_EPOLL)
 	struct epoll_event events[MAX_EVENTS_PER_POLL];
 #elif defined(SPDK_KEVENT)
@@ -1222,81 +1278,25 @@ udp_sock_group_impl_poll(struct spdk_sock_group_impl *_group, int max_events,
 	struct timespec ts = {0};
 #endif
 
-#ifdef SPDK_ZEROCOPY
-	/* When all of the following conditions are met
-	 * - non-blocking socket
-	 * - zero copy is enabled
-	 * - interrupts suppressed (i.e. busy polling)
-	 * - the NIC tx queue is full at the time sendmsg() is called
-	 * - epoll_wait determines there is an EPOLLIN event for the socket
-	 * then we can get into a situation where data we've sent is queued
-	 * up in the kernel network stack, but interrupts have been suppressed
-	 * because other traffic is flowing so the kernel misses the signal
-	 * to flush the software tx queue. If there wasn't incoming data
-	 * pending on the socket, then epoll_wait would have been sufficient
-	 * to kick off the send operation, but since there is a pending event
-	 * epoll_wait does not trigger the necessary operation.
-	 *
-	 * We deal with this by checking for all of the above conditions and
-	 * additionally looking for EPOLLIN events that were not consumed from
-	 * the last poll loop. We take this to mean that the upper layer is
-	 * unable to consume them because it is blocked waiting for resources
-	 * to free up, and those resources are most likely freed in response
-	 * to a pending asynchronous write completing.
-	 *
-	 * Additionally, sockets that have the same placement_id actually share
-	 * an underlying hardware queue. That means polling one of them is
-	 * equivalent to polling all of them. As a quick mechanism to avoid
-	 * making extra poll() calls, stash the last placement_id during the loop
-	 * and only poll if it's not the same. The overwhelmingly common case
-	 * is that all sockets in this list have the same placement_id because
-	 * SPDK is intentionally grouping sockets by that value, so even
-	 * though this won't stop all extra calls to poll(), it's very fast
-	 * and will catch all of them in practice.
-	 */
-	int last_placement_id = -1;
+assert(max_events > 0);
 
-	TAILQ_FOREACH(usock, &group->socks_with_data, link) {
-		if (usock->zcopy && usock->placement_id >= 0 &&
-		    usock->placement_id != last_placement_id) {
-			struct pollfd pfd = {usock->fd, POLLIN | POLLERR, 0};
-
-			poll(&pfd, 1, 0);
-			last_placement_id = usock->placement_id;
-		}
-	}
-#endif
-
-	/* This must be a TAILQ_FOREACH_SAFE because while flushing,
-	 * a completion callback could remove the sock from the
-	 * group. */
-	// TAILQ_FOREACH_SAFE(sock, &_group->socks, link, tmp) {
-	// 	rc = _sock_flush(sock);
-	// 	if (rc < 0 && errno != EAGAIN) {
-	// 		spdk_sock_abort_requests(sock);
-	// 	}
-	// }
-
-	assert(max_events > 0);
-
-	//SPDK_DEBUGLOG(sock,"[TIMING-UDP] Entered udp_sock_group_impl_poll(fd=%d, max_events=%d)\n", group->fd, max_events);
-	//SPDK_DEBUGLOG(sock,"[TIMING-UDP] BEFORE epoll_wait(fd=%d, max_events=%d, timeout=0)\n", group->fd, max_events);
 #if defined(SPDK_EPOLL)
 	num_events = epoll_wait(group->fd, events, max_events, 0);
 #elif defined(SPDK_KEVENT)
 	num_events = kevent(group->fd, NULL, 0, events, max_events, &ts);
 #endif
-	//SPDK_DEBUGLOG(sock,"[TIMING-UDP] AFTER epoll_wait() returned %d events\n", num_events);
 
 	if (num_events == -1) {
 		return -1;
-	} else if (num_events == 0 && !TAILQ_EMPTY(&_group->socks)) {
+	}
+
+	ready = 0;
+
+	if (num_events == 0 && !TAILQ_EMPTY(&_group->socks)) {
 		sock = TAILQ_FIRST(&_group->socks);
 		usock = __udp_sock(sock);
-		/* poll() is called here to busy poll the queue associated with
-		 * first socket in list and potentially reap incoming data.
-		 */
 		if (sock->opts.priority) {
+			/* Hardware busy-poll path: kick the NIC queue */
 			struct pollfd pfd = {0, 0, 0};
 
 			pfd.fd = usock->fd;
@@ -1312,7 +1312,7 @@ udp_sock_group_impl_poll(struct spdk_sock_group_impl *_group, int max_events,
 
 #ifdef SPDK_ZEROCOPY
 		if (events[i].events & EPOLLERR) {
-			rc = _sock_check_zcopy(sock);
+			int rc = _sock_check_zcopy(sock);
 			/* If the socket was closed or removed from
 			 * the group in response to a send ack, don't
 			 * add it to the array here. */
@@ -1324,7 +1324,6 @@ udp_sock_group_impl_poll(struct spdk_sock_group_impl *_group, int max_events,
 		SPDK_DEBUGLOG(sock,"UDP: epoll event[%d] flags=0x%x (EPOLLIN=0x%x, EPOLLOUT=0x%x, EPOLLERR=0x%x, EPOLLHUP=0x%x) fd=%d\n",
 			       i, events[i].events, EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP, usock->fd);
 		if ((events[i].events & EPOLLIN) == 0) {
-			//SPDK_DEBUGLOG(sock,"UDP: Skipping event without EPOLLIN set\n");
 			continue;
 		}
 
@@ -1333,67 +1332,14 @@ udp_sock_group_impl_poll(struct spdk_sock_group_impl *_group, int max_events,
 		usock = __udp_sock(sock);
 #endif
 
-		/* If the socket is not already in the list, add it now */
-		if (!usock->socket_has_data && !usock->pipe_has_data) {
-			TAILQ_INSERT_TAIL(&group->socks_with_data, usock, link);
-		}
-		usock->socket_has_data = true;
-	}
-
-	num_events = 0;
-
-	TAILQ_FOREACH_SAFE(usock, &group->socks_with_data, link, utmp) {
-		if (num_events == max_events) {
-			break;
-		}
-
-		/* If the socket's cb_fn is NULL, just remove it from the
-		 * list and do not add it to socks array */
-		if (spdk_unlikely(usock->base.cb_fn == NULL)) {
-			usock->socket_has_data = false;
-			usock->pipe_has_data = false;
-			TAILQ_REMOVE(&group->socks_with_data, usock, link);
+		if (spdk_unlikely(sock->cb_fn == NULL)) {
 			continue;
 		}
 
-		socks[num_events++] = &usock->base;
+		socks[ready++] = sock;
 	}
 
-	/* Cycle the has_data list so that each time we poll things aren't
-	 * in the same order. Say we have 6 sockets in the list, named as follows:
-	 * A B C D E F
-	 * And all 6 sockets had epoll events, but max_events is only 3. That means
-	 * usock currently points at D. We want to rearrange the list to the following:
-	 * D E F A B C
-	 *
-	 * The variables below are named according to this example to make it easier to
-	 * follow the swaps.
-	 */
-	if (usock != NULL) {
-		struct spdk_udp_sock *pa, *pc, *pd, *pf;
-
-		/* Capture pointers to the elements we need */
-		pd = usock;
-		pc = TAILQ_PREV(pd, spdk_has_data_list, link);
-		pa = TAILQ_FIRST(&group->socks_with_data);
-		pf = TAILQ_LAST(&group->socks_with_data, spdk_has_data_list);
-
-		/* Break the link between C and D */
-		pc->link.tqe_next = NULL;
-
-		/* Connect F to A */
-		pf->link.tqe_next = pa;
-		pa->link.tqe_prev = &pf->link.tqe_next;
-
-		/* Fix up the list first/last pointers */
-		group->socks_with_data.tqh_first = pd;
-		group->socks_with_data.tqh_last = &pc->link.tqe_next;
-
-		/* D is in front of the list, make tqe prev pointer point to the head of list */
-		pd->link.tqe_prev = &group->socks_with_data.tqh_first;
-	}
-
-	return num_events;
+	return ready;
 }
 
 static int
@@ -1588,55 +1534,89 @@ udp_sock_writev_direct(struct spdk_sock *_sock, struct iovec *iov, int iovcnt, s
 	return rc;
 }
 
-static size_t
-udp_sock_recv_with_msghdr(struct spdk_sock *_sock, void *buf, size_t len,
-			  struct msghdr *msg)
+static int
+udp_sock_recv_with_msghdr(struct spdk_sock *_sock, struct mmsghdr *msgs, int vlen)
 {
 	struct spdk_udp_sock *sock = __udp_sock(_sock);
-	struct spdk_udp_sock_group_impl *group;
-	struct iovec iov;
-	ssize_t rc;
+	int n;
 
-	iov.iov_base = buf;
-	iov.iov_len = len;
-
-	msg->msg_iov = &iov;
-	msg->msg_iovlen = 1;
-
-	rc = recvmsg(sock->fd, msg, MSG_DONTWAIT);
-	if (rc <= 0) {
-		/* Socket is drained or error occurred - clear socket_has_data flag
-		 * and remove from socks_with_data list to prevent spurious wakeups. */
-		if (sock->base.group_impl) {
-			group = __udp_group_impl(sock->base.group_impl);
-			TAILQ_REMOVE(&group->socks_with_data, sock, link);
+	n = recvmmsg(sock->fd, msgs, vlen, MSG_DONTWAIT, NULL);
+	if (n < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			return 0;
 		}
-		sock->socket_has_data = false;
-
-		if (rc < 0) { 
-			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				return 0;
-			}
-			return -1;
-		}
-		return 0;
+		return -1;
 	}
-
-	/* Update stored remote address length */
-	sock->remote_addr_len = msg->msg_namelen;
-
-	if (rc > 0) {
-		SPDK_DEBUGLOG(sock,"udp_sock_recv() received %zd bytes from %s:%d with the sock %p\n", rc,
-			      inet_ntoa(((struct sockaddr_in *)msg->msg_name)->sin_addr),
-			      ntohs(((struct sockaddr_in *)msg->msg_name)->sin_port),
-			      sock);
-	}
-
-	return rc;
+	return n;
 }
 
 
 
+
+static int
+udp_sock_writev_direct_batch(struct spdk_sock *_sock, struct mmsghdr *msgs, int n)
+{
+	struct spdk_udp_sock *sock = __udp_sock(_sock);
+	int rc;
+
+	rc = sendmmsg(sock->fd, msgs, n, MSG_DONTWAIT | MSG_NOSIGNAL);
+	if (rc < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			return 0;
+		}
+		return -1;
+	}
+	return rc;
+}
+
+#ifdef __linux__
+static int
+udp_sock_writev_direct_gso(struct spdk_sock *_sock, struct iovec *iov, size_t segment_size,
+			   struct sockaddr *addr, socklen_t addrlen)
+{
+	struct spdk_udp_sock *sock = __udp_sock(_sock);
+	char cmsgbuf[CMSG_SPACE(sizeof(uint16_t))] = {};
+	struct msghdr msg = {
+		.msg_name    = addr,
+		.msg_namelen = addrlen,
+		.msg_iov     = iov,
+		.msg_iovlen  = 1,
+		.msg_control = cmsgbuf,
+	};
+	ssize_t rc;
+
+	/* Set UDP_SEGMENT only when there are multiple segments */
+	if (segment_size > 0 && iov->iov_len > segment_size) {
+		/* Directly cast cmsgbuf — CMSG_FIRSTHDR() returns NULL when msg_controllen==0 */
+		struct cmsghdr *cmsg = (struct cmsghdr *)cmsgbuf;
+		cmsg->cmsg_level = SOL_UDP;
+		cmsg->cmsg_type  = UDP_SEGMENT;
+		cmsg->cmsg_len   = CMSG_LEN(sizeof(uint16_t));
+		*(uint16_t *)CMSG_DATA(cmsg) = (uint16_t)segment_size;
+		msg.msg_controllen = CMSG_SPACE(sizeof(uint16_t));
+	} else {
+		msg.msg_control    = NULL;
+		msg.msg_controllen = 0;
+	}
+
+	rc = sendmsg(sock->fd, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
+	if (rc < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			return 0;
+		}
+		return -1;
+	}
+	return (int)rc;
+}
+#else
+static int
+udp_sock_writev_direct_gso(struct spdk_sock *_sock, struct iovec *iov, size_t segment_size,
+			   struct sockaddr *addr, socklen_t addrlen)
+{
+	/* GSO not supported on this platform — fall back to plain sendmsg */
+	return udp_sock_writev_direct(_sock, iov, 1, addr, addrlen);
+}
+#endif
 
 static struct spdk_net_impl g_udp_net_impl = {
 	.name		= "udp",
@@ -1667,6 +1647,8 @@ static struct spdk_net_impl g_udp_net_impl = {
 	.get_opts		= udp_sock_impl_get_opts,
 	.set_opts		= udp_sock_impl_set_opts,
 	.writev_direct = udp_sock_writev_direct,
+	.writev_direct_batch = udp_sock_writev_direct_batch,
+	.writev_direct_gso = udp_sock_writev_direct_gso,
 	.recv_with_msghdr = udp_sock_recv_with_msghdr,
 };
 

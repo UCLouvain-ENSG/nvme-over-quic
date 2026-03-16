@@ -122,8 +122,14 @@ struct spdk_net_impl {
 
 	int (*writev_direct)(struct spdk_sock *sock, struct iovec *iov, int iovcnt, struct sockaddr *addr, socklen_t addrlen);
 
-	ssize_t (*recv_with_msghdr)(struct spdk_sock *sock, void *buf, size_t len,
-				    struct msghdr *msg);
+	/* Send N datagrams (pre-built mmsghdr array) in a single sendmmsg() syscall */
+	int (*writev_direct_batch)(struct spdk_sock *sock, struct mmsghdr *msgs, int n);
+
+	/* Send a single contiguous buffer as N equal-sized UDP datagrams using GSO */
+	int (*writev_direct_gso)(struct spdk_sock *sock, struct iovec *iov, size_t segment_size,
+				 struct sockaddr *addr, socklen_t addrlen);
+
+	int (*recv_with_msghdr)(struct spdk_sock *sock, struct mmsghdr *msgs, int vlen);
 					
 	STAILQ_ENTRY(spdk_net_impl) link;
 };

@@ -521,10 +521,15 @@ void spdk_sock_writev_async(struct spdk_sock *sock, struct spdk_sock_request *re
 int spdk_sock_writev_direct(struct spdk_sock *sock, struct iovec *iov, int iovcnt,
 			  struct sockaddr *addr, socklen_t addrlen);
 
+/* for UDP: send N datagrams (pre-built mmsghdr array) in one sendmmsg() syscall */
+int spdk_sock_writev_direct_batch(struct spdk_sock *sock, struct mmsghdr *msgs, int n);
+
+/* for UDP: send a single large iovec as equal-sized UDP datagrams using GSO (one sendmsg syscall) */
+int spdk_sock_writev_direct_gso(struct spdk_sock *sock, struct iovec *iov, size_t segment_size,
+				struct sockaddr *addr, socklen_t addrlen);
 
 /* for UDP */
-size_t spdk_sock_recv_with_msghdr(struct spdk_sock *sock, void *buf, size_t len,
-				struct msghdr *msg);
+int spdk_sock_recv_with_msghdr(struct spdk_sock *sock, struct mmsghdr *msgs, int vlen);
 
 
 

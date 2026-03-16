@@ -12,6 +12,14 @@ struct {
     __type(value, __u32);
 } reuseport_array SEC(".maps");
 
+/* Config map: key=0 holds num_sockets (populated by userspace after all sockets are ready) */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} config_map SEC(".maps");
+
 /* Debug/stats map to track what eBPF is seeing */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -132,8 +140,12 @@ int select_socket(struct sk_reuseport_md *reuse_md) {
         //bpf_printk("Short header: shard_id=%u (from DCID[0])", shard_id);
     }
     
-    /* Route to socket based on shard_id modulo number of sockets */
-    index = shard_id % 4;
+    /* Route to socket based on shard_id modulo number of sockets.
+     * Read num_sockets from config_map so we don't hardcode 4. */
+    __u32 cfg_key = 0;
+    __u32 *num_sockets_ptr = bpf_map_lookup_elem(&config_map, &cfg_key);
+    __u32 num_sockets = (num_sockets_ptr && *num_sockets_ptr > 0) ? *num_sockets_ptr : 4;
+    index = shard_id % num_sockets;
     //bpf_printk("Routing to index=%u (shard_id=%u)", index, shard_id);
     
     /* Track per-index routing (keys 0-3) */
