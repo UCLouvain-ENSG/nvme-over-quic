@@ -16,4 +16,4 @@ rm -f build/lib/libspdk_nvme.a
 
 # Build
 echo "Building SPDK with quicly..."
-mkdir -p ~/tmp && TMPDIR=~/tmp make -j$(nproc) 2>&1
+mkdir -p ~/tmp && TMPDIR=~/tmp PYTHONWARNINGS=ignore make -j$(nproc) 2>&1

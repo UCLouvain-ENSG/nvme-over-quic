@@ -715,6 +715,8 @@ posix_sock_create_ssl_context(const SSL_METHOD *method, struct spdk_sock_impl_op
 	}
 	SPDK_DEBUGLOG(sock_posix, "SSL context created\n");
 
+	SSL_CTX_set_mode(ctx, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+
 	switch (impl_opts->tls_version) {
 	case 0:
 		/* auto-negotiation */
@@ -877,13 +879,52 @@ SSL_readv(SSL *ssl, const struct iovec *iov, int iovcnt)
 	}
 }
 
+/* Set to 1 to flatten all iovecs into a single buffer before SSL_write
+ * (one TLS record per writev call).
+ * Set to 0 to call SSL_write once per iovec (original behaviour). */
+#define SSL_WRITEV_FLATTEN 1
+
 static ssize_t
 SSL_writev(SSL *ssl, struct iovec *iov, int iovcnt)
 {
-	int i, rc = 0;
+	int rc = 0;
 	ssize_t total = 0;
 
+#if SSL_WRITEV_FLATTEN
+	/* Flatten all iovecs into a single contiguous buffer, then issue one
+	 * SSL_write call.  This produces a single TLS record and avoids the
+	 * per-iovec SSL_write overhead (record header + MAC per fragment). */
+	size_t flat_len = 0;
+	uint8_t *flat_buf, *p;
+	int i;
+
 	for (i = 0; i < iovcnt; i++) {
+		flat_len += iov[i].iov_len;
+	}
+
+	flat_buf = malloc(flat_len);
+	if (!flat_buf) {
+		errno = ENOMEM;
+		return -1;
+	}
+
+	p = flat_buf;
+	for (i = 0; i < iovcnt; i++) {
+		memcpy(p, iov[i].iov_base, iov[i].iov_len);
+		p += iov[i].iov_len;
+	}
+
+	rc = SSL_write(ssl, flat_buf, flat_len);
+	free(flat_buf);
+
+	if (rc > 0) {
+		total = rc;
+		errno = 0;
+		return total;
+	}
+#else
+	/* Original: one SSL_write call per iovec. */
+	for (int i = 0; i < iovcnt; i++) {
 		rc = SSL_write(ssl, iov[i].iov_base, iov[i].iov_len);
 
 		if (rc > 0) {
@@ -897,6 +938,8 @@ SSL_writev(SSL *ssl, struct iovec *iov, int iovcnt)
 		errno = 0;
 		return total;
 	}
+#endif
+
 	switch (SSL_get_error(ssl, rc)) {
 	case SSL_ERROR_ZERO_RETURN:
 		errno = ENOTCONN;
