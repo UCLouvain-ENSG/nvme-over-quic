@@ -31,21 +31,27 @@
 #include "quicly/streambuf.h"
 
 
-#define SPDK_CRC32C_XOR				0xffffffffUL
-#define SPDK_NVME_QUIC_DIGEST_LEN		4
-#define SPDK_NVME_QUIC_DIGEST_ALIGNMENT		4
-#define SPDK_NVME_QUIC_QPAIR_EXIT_TIMEOUT	30
 #define SPDK_NVMF_QUIC_RECV_BUF_SIZE_FACTOR	8
 #define SPDK_NVME_QUIC_IN_CAPSULE_DATA_MAX_SIZE	4096u
 
+// #define SPDK_NVME_QUIC_MAX_UDP_DATAGRAM_SIZE		1472u
+// #define SPDK_NVME_QUIC_MAX_SEND_PACKETS		64u
+
+// MTU 1500
 #define SPDK_NVME_QUIC_MAX_UDP_DATAGRAM_SIZE		1472u
-#define SPDK_NVME_QUIC_MAX_SEND_PACKETS		32u
+
+// MTU 9000
+// #define SPDK_NVME_QUIC_MAX_UDP_DATAGRAM_SIZE		8972u
+#define SPDK_NVME_QUIC_MAX_SEND_PACKETS		128u  /* 128 × 1472 = 184 KB/batch; reduces syscalls, fits L2 cache */
+
+#define SPDK_NVME_QUIC_MAX_STREAM_BIDI		1024u
 
 
-#define UDP_RECV_BATCH_SIZE     64
+#define UDP_RECV_BATCH_SIZE     64  /* Match send batch size for balanced recv/send throughput */
+
 /* Each recv slot must be large enough to hold a full UDP GRO super-segment.
  * The kernel coalesces up to 64KB, so allocate that much per slot. */
-#define UDP_RECV_BATCH_BUF_SIZE (64 * 1024)
+#define UDP_RECV_BATCH_BUF_SIZE 65536
 /* Space for the UDP_GRO cmsg (gso_size) returned per slot */
 #define UDP_RECV_CMSG_SIZE      CMSG_SPACE(sizeof(uint16_t))
 
@@ -53,49 +59,14 @@
  * Maximum number of SGL elements.
  */
 #define NVME_QUIC_MAX_SGL_DESCRIPTORS	(16)
-#define MAKE_DIGEST_WORD(BUF, CRC32C) \
-        (   ((*((uint8_t *)(BUF)+0)) = (uint8_t)((uint32_t)(CRC32C) >> 0)), \
-            ((*((uint8_t *)(BUF)+1)) = (uint8_t)((uint32_t)(CRC32C) >> 8)), \
-            ((*((uint8_t *)(BUF)+2)) = (uint8_t)((uint32_t)(CRC32C) >> 16)), \
-            ((*((uint8_t *)(BUF)+3)) = (uint8_t)((uint32_t)(CRC32C) >> 24)))
-
-#define MATCH_DIGEST_WORD(BUF, CRC32C) \
-        (    ((((uint32_t) *((uint8_t *)(BUF)+0)) << 0)         \
-            | (((uint32_t) *((uint8_t *)(BUF)+1)) << 8)         \
-            | (((uint32_t) *((uint8_t *)(BUF)+2)) << 16)        \
-            | (((uint32_t) *((uint8_t *)(BUF)+3)) << 24))       \
-            == (CRC32C))
-
-#define DGET32(B)                                                               \
-        (((  (uint32_t) *((uint8_t *)(B)+0)) << 0)                              \
-         | (((uint32_t) *((uint8_t *)(B)+1)) << 8)                              \
-         | (((uint32_t) *((uint8_t *)(B)+2)) << 16)                             \
-         | (((uint32_t) *((uint8_t *)(B)+3)) << 24))
-
-#define DSET32(B,D)                                                             \
-        (((*((uint8_t *)(B)+0)) = (uint8_t)((uint32_t)(D) >> 0)),               \
-         ((*((uint8_t *)(B)+1)) = (uint8_t)((uint32_t)(D) >> 8)),               \
-         ((*((uint8_t *)(B)+2)) = (uint8_t)((uint32_t)(D) >> 16)),              \
-         ((*((uint8_t *)(B)+3)) = (uint8_t)((uint32_t)(D) >> 24)))
-
 
 
 #define nvme_quic_stream_container_of(ptr, type, member) \
     ((type *)((char *)(ptr) - offsetof(type, member)))
 
-/* The PSK identity comprises of following components:
- * 4-character format specifier "NVMe" +
- * 1-character TLS protocol version indicator +
- * 1-character PSK type indicator, specifying the used PSK +
- * 2-characters hash specifier +
- * NQN of the host (SPDK_NVMF_NQN_MAX_LEN -> 223) +
- * NQN of the subsystem (SPDK_NVMF_NQN_MAX_LEN -> 223) +
- * 2 space character separators +
- * 1 null terminator =
- * 457 characters. */
+
 #define NVMF_PSK_IDENTITY_LEN (SPDK_NVMF_NQN_MAX_LEN + SPDK_NVMF_NQN_MAX_LEN + 11)
 
-/* The maximum size of hkdf_info is defined by RFC 8446, 514B (2 + 256 + 256). */
 #define NVME_QUIC_HKDF_INFO_MAX_LEN 514
 
 #define PSK_ID_PREFIX "NVMe0R"
@@ -110,9 +81,6 @@ enum nvme_quic_hash_algorithm {
 	NVME_QUIC_HASH_ALGORITHM_SHA256,
 	NVME_QUIC_HASH_ALGORITHM_SHA384,
 };
-
-/* The maximum size of hkdf_info is defined by RFC 8446, 514B (2 + 256 + 256). */
-#define NVME_QUIC_HKDF_INFO_MAX_LEN 514
 
 
 typedef void (*nvme_quic_qpair_xfer_complete_cb)(void *cb_arg);
@@ -208,8 +176,9 @@ struct nvme_quic_stream {
 	void						*req;   /* nvme_quic_req* or nvmf_quic_req* */
 	void						*qpair; /* owning nvme_quic_qpair* (persists for stream lifetime) */
 
-	/* Free-list linkage — used by target-side (nvmf/quic.c) stream pool.
-	 * Not used by client-side (lib/nvme/nvme_quic.c) since streams are embedded in reqs. */
+	bool					in_pending_queue;
+
+	/* Free-list linkage — used by target-side (nvmf/quic.c) stream pool. */
 	TAILQ_ENTRY(nvme_quic_stream)		stream_link;
 };
 

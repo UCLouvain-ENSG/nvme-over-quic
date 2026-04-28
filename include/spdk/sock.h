@@ -192,6 +192,32 @@ struct spdk_sock_impl_opts {
 	 * example: "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256"
 	 */
 	const char *tls_cipher_suites;
+
+	/**
+	 * eBPF program file descriptor for SO_REUSEPORT steering. Used by udp socket module.
+	 * Set to -1 to disable eBPF steering.
+	 */
+	int ebpf_prog_fd;
+
+	/**
+	 * eBPF socket-array map file descriptor. Used by udp socket module.
+	 */
+	int ebpf_map_fd;
+
+	/**
+	 * eBPF config map file descriptor. Used by udp socket module.
+	 */
+	int ebpf_config_map_fd;
+
+	/**
+	 * Index of this socket within the eBPF socket array. Used by udp socket module.
+	 */
+	int ebpf_socket_index;
+
+	/**
+	 * Total number of sockets for eBPF config. Used by udp socket module.
+	 */
+	int ebpf_num_sockets;
 };
 
 /**

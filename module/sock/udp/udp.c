@@ -66,14 +66,14 @@ udp_getaddrinfo(const char *ip, int port)
 #define MAX_TMPBUF 1024
 #define IOV_BATCH_SIZE 64
 #define MAX_EVENTS_PER_POLL 32
-#define DEFAULT_SO_RCVBUF_SIZE (2 * 1024 * 1024)
-#define DEFAULT_SO_SNDBUF_SIZE (2 * 1024 * 1024)
+#define DEFAULT_SO_RCVBUF_SIZE (256 * 1024 * 1024)  /* 256 MB - matches kernel net.core.rmem_max */
+#define DEFAULT_SO_SNDBUF_SIZE (256 * 1024 * 1024)  /* 256 MB - matches kernel net.core.wmem_max */
 #define MIN_SO_RCVBUF_SIZE (256 * 1024)
 #define MIN_SO_SNDBUF_SIZE (256 * 1024)
 
-/* recvmmsg() batch receive: drain up to 32 UDP datagrams per syscall */
+/* recvmmsg() batch receive: drain up to 64 UDP datagrams per syscall */
 #define UDP_RECV_BATCH_SIZE     64
-#define UDP_RECV_BATCH_BUF_SIZE 2048  /* >= quicly default max_udp_payload_size (1472) */
+#define UDP_RECV_BATCH_BUF_SIZE 65536  /* Support full UDP GRO super-segment (64 KB coalesced packets) */
 
 struct  spdk_udp_sock {
 	struct spdk_sock	base;
@@ -477,6 +477,9 @@ udp_sock_listen(const char *ip, int port, struct spdk_sock_opts *opts)
 				SPDK_ERRLOG("eBPF: SO_ATTACH_REUSEPORT_EBPF failed: errno=%d (%s)\n",
 					    errno, strerror(errno));
 			}
+			SPDK_NOTICELOG("reuseport_array[%u] = fd %d (reactor=%d cpu=%d)\n",
+                       key, fd, (int)impl_opts.ebpf_socket_index,
+                       (int)spdk_env_get_current_core());
 			if (impl_opts.ebpf_config_map_fd >= 0) {
 				__u32 cfg_key = 0;
 				__u32 num = (__u32)impl_opts.ebpf_num_sockets;
@@ -1357,7 +1360,6 @@ udp_sock_recv_with_msghdr(struct spdk_sock *_sock, struct mmsghdr *msgs, int vle
 	}
 	return n;
 }
-
 
 
 
