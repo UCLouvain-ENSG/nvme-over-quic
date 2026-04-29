@@ -12,7 +12,7 @@ BPF_TARGET = reuseport_kern.o
 BPF_SRC = reuseport_kern.c
 
 # Include paths
-INCLUDES = -I/usr/include -I/usr/include/bpf
+INCLUDES = -I/usr/include -I/usr/include/bpf -I/usr/include/x86_64-linux-gnu
 
 # Compiler flags for eBPF
 BPF_CFLAGS = -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH) $(INCLUDES)

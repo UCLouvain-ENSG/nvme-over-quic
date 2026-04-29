@@ -1500,9 +1500,6 @@ _nvmf_quic_send_pending(struct spdk_nvmf_quic_qpair *qqpair)
 		 * followed by one shorter terminal packet, matching the GSO contract
 		 * that all-but-last segments must be exactly segment_size.
 		 *
-		 * When pad_last_datagram is enabled every packet is the same size,
-		 * so the entire quicly_send() output becomes a single sub-batch.
-		 *
 		 * Example (no pad): [1472][1472][1469][1472][1472][1469]
 		 *   sub-batch 0: [1472][1472][1469]  seg_size=1472
 		 *   sub-batch 1: [1472][1472][1469]  seg_size=1472
@@ -3233,8 +3230,6 @@ nvmf_quic_create(struct spdk_nvmf_transport_opts *opts)
 	/* Send large datagrams immediately (no PMTU probing needed on loopback) */
 	qtransport->quic_ctx->transport_params.max_udp_payload_size = SPDK_NVME_QUIC_MAX_UDP_DATAGRAM_SIZE;
 
-    { const char *_e = getenv("QUIC_PAD_LAST_DATAGRAM"); qtransport->quic_ctx->pad_last_datagram = (_e && *_e && *_e != '0'); }
-	// qtransport->quic_ctx->pad_last_datagram = 1;
 	/* Link TLS context to QUIC context */
 	qtransport->quic_ctx->tls = qtransport->tls_ctx;
 	
