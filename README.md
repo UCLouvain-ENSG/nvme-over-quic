@@ -101,13 +101,27 @@ This allocates 2 GB (1024 × 2 MB). Verify with:
 grep HugePages_Total /proc/meminfo
 ~~~
 
-### 2. Start the target (controller side)
+### 2. Kernel network tuning (optional but recommended)
+
+Run the tuning script to optimize socket buffers, TCP/UDP parameters, and NIC offloads before starting the target:
+
+~~~{.sh}
+sudo ./scripts/tuning_kernel.sh <interface>   # e.g. ens1f0np0 or lo
+~~~
+
+This sets:
+- Socket buffer limits (rmem/wmem up to 256 MB)
+- TCP congestion control to cubic (for fair comparison with QUIC)
+- UDP buffer minimums for high-throughput QUIC
+- NIC offloads: GRO, GSO, TSO, UDP segmentation
+
+### 3. Start the target (controller side)
 
 ~~~{.sh}
 sudo ./scripts/controller_run.sh --lcore 0
 ~~~
 
-### 3. Run the host (initiator side)
+### 4. Run the host (initiator side)
 
 ~~~{.sh}
 # QUIC transport (default example)
