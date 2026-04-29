@@ -330,8 +330,8 @@ nvme_quic_req_get(struct nvme_quic_qpair *qqpair)
 
     quic_req = TAILQ_FIRST(&qqpair->free_reqs);
     if (!quic_req) {
-		// SPDK_DEBUGLOG(nvme_quic_measure, "[REQ_GET] No free req available\n");
-		SPDK_ERRLOG("[REQ_GET] No free req available\n");
+		SPDK_DEBUGLOG(nvme_quic_measure, "[REQ_GET] No free req available\n");
+		//SPDK_ERRLOG("[REQ_GET] No free req available\n");
         return NULL;
     }
 
@@ -2435,13 +2435,15 @@ nvme_quic_ctrlr_create_qpair(struct spdk_nvme_ctrlr *ctrlr,
 		return NULL;
 	}
 
-	/* Initialize per-qpair CID generator with unique thread_id (qid) */
+	/* Initialize per-qpair CID generator with unique thread_id (core/lcore)
+	 * Use lcore instead of qid so multiple namespaces on same core share the same shard_id.
+	 * This ensures eBPF SO_REUSEPORT routing works correctly with multiple namespaces. */
 	qqpair->next_cid.master_id = 0;
-	qqpair->next_cid.thread_id = qid;  /* Unique across all qpairs */
+	qqpair->next_cid.thread_id = spdk_env_get_current_core();  /* Maps to server socket/core */
 	qqpair->next_cid.node_id = 0;
 	
-	SPDK_DEBUGLOG(nvme, "CLIENT qid=%u: Initialized next_cid with thread_id=%u for eBPF routing\n",
-	               qid, qqpair->next_cid.thread_id);
+	SPDK_DEBUGLOG(nvme, "CLIENT qid=%u on lcore %u: Set thread_id=%u for QUIC CID (eBPF routing)\n",
+	             qid, spdk_env_get_current_core(), qqpair->next_cid.thread_id);
 
 	/* Pre-allocate recv batch once to avoid 256KB stack alloc + init on every recv call */
 	qqpair->recv_batch = calloc(1, sizeof(struct spdk_udp_recv_batch));

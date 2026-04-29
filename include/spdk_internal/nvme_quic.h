@@ -269,7 +269,7 @@ _nvme_quic_sgl_append_multi_with_md(struct spdk_iov_sgl *s, struct iovec *iov, i
 	return true;
 }
 
-static int
+static inline int
 nvme_quic_build_payload_iovs(struct iovec *iov, int iovcnt, struct iovec *data_iov,
 			    uint32_t data_iovcnt, uint32_t rw_offset, uint32_t *_mapped_length)
 {
@@ -293,7 +293,7 @@ end:
 	return iovcnt - sgl.iovcnt;
 }
 
-static int
+static inline int
 nvme_quic_read_data(struct spdk_sock *sock, int bytes,
 		   void *buf)
 {
@@ -301,14 +301,14 @@ nvme_quic_read_data(struct spdk_sock *sock, int bytes,
 }
 
 
-static int
+static inline int
 nvme_quic_read_data_with_msghdr(struct spdk_sock *sock, struct mmsghdr *msgs, int vlen)
 {
     return spdk_sock_recv_with_msghdr(sock, msgs, vlen);
 }
 
 
-static int
+static inline int
 nvme_quic_readv_data(struct spdk_sock *sock, struct iovec *iov, int iovcnt)
 {
 	int ret;
@@ -345,7 +345,7 @@ nvme_quic_readv_data(struct spdk_sock *sock, struct iovec *iov, int iovcnt)
 }
 
 
-static void
+static inline void
 nvme_quic_stream_set_data_buf(struct nvme_quic_stream *stream,
 			  struct iovec *iov, uint32_t len, quicly_streambuf_sendvec_callbacks_t *cb)
 {
@@ -358,7 +358,7 @@ nvme_quic_stream_set_data_buf(struct nvme_quic_stream *stream,
 	stream->data_buf.cbdata = &stream->data_element;
 }
 
-static void
+static inline void
 nvme_quic_stream_set_cmd_buf(struct nvme_quic_stream *stream,
 			 struct spdk_nvme_cmd *cmd,
 			 quicly_streambuf_sendvec_callbacks_t *cb)
@@ -372,7 +372,7 @@ nvme_quic_stream_set_cmd_buf(struct nvme_quic_stream *stream,
 	stream->hdr_buf.cbdata = &stream->hdr_element;
 }
 
-static void
+static inline void
 nvme_quic_stream_set_rsp_buf(struct nvme_quic_stream *stream,
 			 struct spdk_nvme_cpl *rsp,
 			 quicly_streambuf_sendvec_callbacks_t *cb)
@@ -386,7 +386,7 @@ nvme_quic_stream_set_rsp_buf(struct nvme_quic_stream *stream,
 	stream->hdr_buf.cbdata = &stream->hdr_element;
 }
 
-static void
+static inline void
 nvme_quic_stream_set_r2t_buf(struct nvme_quic_stream *stream,
 			 struct spdk_nvme_quic_r2t *r2t,
 			 quicly_streambuf_sendvec_callbacks_t *cb)
