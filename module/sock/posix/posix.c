@@ -882,7 +882,7 @@ SSL_readv(SSL *ssl, const struct iovec *iov, int iovcnt)
 /* Set to 1 to flatten all iovecs into a single buffer before SSL_write
  * (one TLS record per writev call).
  * Set to 0 to call SSL_write once per iovec (original behaviour). */
-#define SSL_WRITEV_FLATTEN 1
+#define SSL_WRITEV_FLATTEN 0
 
 static ssize_t
 SSL_writev(SSL *ssl, struct iovec *iov, int iovcnt)
