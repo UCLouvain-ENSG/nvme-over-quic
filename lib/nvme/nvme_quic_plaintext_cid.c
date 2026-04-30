@@ -82,6 +82,11 @@ hybrid_decrypt_cid(quicly_cid_encryptor_t *_self, quicly_cid_plaintext_t *plaint
 	uint8_t decrypted_buf[16];
 	const uint8_t *p;
 	
+	(void)self;
+	(void)full_encrypted;
+	(void)decrypted_buf;
+	(void)p;
+	
 	/* Validate CID length */
 	if (len != 0 && len != HYBRID_CID_LEN) {
 		return SIZE_MAX;  /* Invalid CID */

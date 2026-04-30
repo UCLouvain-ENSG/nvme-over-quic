@@ -21,6 +21,7 @@
 #include "spdk/string.h"
 #include "spdk/net.h"
 #include "spdk/log.h"
+#include "spdk/file.h"
 #include "spdk_internal/sock_module.h"
 
 /* UDP-specific helper functions (copied from sock.c to avoid modifying shared code) */
@@ -66,6 +67,12 @@ udp_getaddrinfo(const char *ip, int port)
 #define MAX_TMPBUF 1024
 #define IOV_BATCH_SIZE 64
 #define MAX_EVENTS_PER_POLL 32
+
+/* Override default buffer sizes for UDP/QUIC high-throughput */
+#undef DEFAULT_SO_RCVBUF_SIZE
+#undef DEFAULT_SO_SNDBUF_SIZE
+#undef MIN_SO_RCVBUF_SIZE
+#undef MIN_SO_SNDBUF_SIZE
 #define DEFAULT_SO_RCVBUF_SIZE (256 * 1024 * 1024)  /* 256 MB - matches kernel net.core.rmem_max */
 #define DEFAULT_SO_SNDBUF_SIZE (256 * 1024 * 1024)  /* 256 MB - matches kernel net.core.wmem_max */
 #define MIN_SO_RCVBUF_SIZE (256 * 1024)
@@ -823,6 +830,7 @@ udp_sock_group_impl_get_optimal(struct spdk_sock *_sock, struct spdk_sock_group_
 	return NULL;
 }
 
+__attribute__((unused))
 static int
 udp_sock_alloc_pipe(struct spdk_udp_sock *sock __attribute__((unused)), int sz __attribute__((unused)))
 {

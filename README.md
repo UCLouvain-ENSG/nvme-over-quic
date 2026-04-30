@@ -140,7 +140,7 @@ Key `host_run.sh` options (extra args are passed to `spdk_nvme_perf`):
 |---|---|
 | `-m quic\|tls\|tcp` | Transport mode |
 | `-i <ip>` | Target IP address |
-| `-c <cpumask>` | CPU core mask (e.g. `0x1` for core 0) |
+| `-c <cpumask>` | CPU core mask (e.g. `0x1` for core 1, `0xF` for cores 0,1,2,3) |
 | `-q <depth>` | I/O queue depth |
 | `-o <size>` | I/O size in bytes |
 | `-w <pattern>` | Workload: `randread`, `randwrite`, `randrw`, `read`, `write` |
