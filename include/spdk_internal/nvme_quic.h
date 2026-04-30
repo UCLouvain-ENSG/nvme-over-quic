@@ -347,7 +347,7 @@ nvme_quic_readv_data(struct spdk_sock *sock, struct iovec *iov, int iovcnt)
 
 static inline void
 nvme_quic_stream_set_data_buf(struct nvme_quic_stream *stream,
-			  struct iovec *iov, uint32_t len, quicly_streambuf_sendvec_callbacks_t *cb)
+			  struct iovec *iov, uint32_t len, const quicly_streambuf_sendvec_callbacks_t *cb)
 {
 	stream->data_buf.cb = cb;
 	stream->data_buf.len = len;
@@ -361,7 +361,7 @@ nvme_quic_stream_set_data_buf(struct nvme_quic_stream *stream,
 static inline void
 nvme_quic_stream_set_cmd_buf(struct nvme_quic_stream *stream,
 			 struct spdk_nvme_cmd *cmd,
-			 quicly_streambuf_sendvec_callbacks_t *cb)
+			 const quicly_streambuf_sendvec_callbacks_t *cb)
 {
 	stream->hdr_buf.cb = cb;
 	stream->hdr_buf.len = 64; /* NVMe command size */
