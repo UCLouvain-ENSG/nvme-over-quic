@@ -166,6 +166,10 @@ struct ns_worker_ctx {
 
 	TAILQ_HEAD(, perf_task)		queued_tasks;
 
+	/* Open-loop rate limiting: tasks returned here after completion, re-submitted on schedule */
+	TAILQ_HEAD(, perf_task)		free_tasks;
+	uint64_t			next_submit_tsc;	/* TSC of next allowed submission */
+
 	struct spdk_histogram_data	*histogram;
 	int				status;
 };
@@ -277,6 +281,9 @@ static uint8_t g_transport_tos = 0;
 
 static uint32_t g_rdma_srq_size;
 static struct spdk_key *g_psk = NULL, *g_dhchap = NULL, *g_dhchap_ctrlr = NULL;
+
+/* Open-loop rate limiting: inter-arrival interval in nanoseconds (0 = disabled / closed-loop) */
+static uint64_t g_rate_limit_ns = 0;
 
 /* When user specifies -Q, some error messages are rate limited.  When rate
  * limited, we only print the error message every g_quiet_count times the
@@ -1534,6 +1541,10 @@ task_complete(struct perf_task *task)
 		free(task->iovs);
 		spdk_dma_free(task->md_iov.iov_base);
 		free(task);
+	} else if (spdk_unlikely(g_rate_limit_ns != 0)) {
+		/* Open-loop mode: return task to free pool; work_fn timer re-submits on schedule.
+		 * current_queue_depth was already decremented at the top of task_complete(). */
+		TAILQ_INSERT_TAIL(&ns_ctx->free_tasks, task, link);
 	} else {
 		submit_single_io(task);
 	}
@@ -1594,10 +1605,24 @@ submit_io(struct ns_worker_ctx *ns_ctx, int queue_depth)
 	}
 }
 
+/* Open-loop: pre-allocate all tasks into free_tasks; the work_fn timer submits them. */
+static void
+prealloc_tasks(struct ns_worker_ctx *ns_ctx, int count)
+{
+	struct perf_task *task;
+
+	while (count-- > 0) {
+		task = allocate_task(ns_ctx, count);
+		TAILQ_INSERT_TAIL(&ns_ctx->free_tasks, task, link);
+	}
+}
+
 static int
 init_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 {
 	TAILQ_INIT(&ns_ctx->queued_tasks);
+	TAILQ_INIT(&ns_ctx->free_tasks);
+	ns_ctx->next_submit_tsc = 0;  /* will be set on first submission */
 	return ns_ctx->entry->fn_table->init_ns_worker_ctx(ns_ctx);
 }
 
@@ -1609,6 +1634,14 @@ cleanup_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 	TAILQ_FOREACH_SAFE(task, &ns_ctx->queued_tasks, link, ttask) {
 		TAILQ_REMOVE(&ns_ctx->queued_tasks, task, link);
 		task_complete(task);
+	}
+	/* Free any tasks parked in the open-loop free pool */
+	TAILQ_FOREACH_SAFE(task, &ns_ctx->free_tasks, link, ttask) {
+		TAILQ_REMOVE(&ns_ctx->free_tasks, task, link);
+		spdk_dma_free(task->iovs[0].iov_base);
+		free(task->iovs);
+		spdk_dma_free(task->md_iov.iov_base);
+		free(task);
 	}
 	ns_ctx->entry->fn_table->cleanup_ns_worker_ctx(ns_ctx);
 }
@@ -1721,9 +1754,16 @@ work_fn(void *arg)
 		tsc_end = tsc_current + g_time_in_sec * g_tsc_rate;
 	}
 
-	/* Submit initial I/O for each namespace. */
+	/* Submit initial I/O for each namespace.
+	 * In open-loop (rate-limit) mode, pre-allocate all tasks into free_tasks;
+	 * the work_fn timer drives actual submissions at the configured rate. */
 	TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
-		submit_io(ns_ctx, g_queue_depth);
+		if (g_rate_limit_ns != 0) {
+			ns_ctx->next_submit_tsc = spdk_get_ticks();
+			prealloc_tasks(ns_ctx, g_queue_depth);
+		} else {
+			submit_io(ns_ctx, g_queue_depth);
+		}
 	}
 
 	while (spdk_likely(!g_exit)) {
@@ -1747,6 +1787,20 @@ work_fn(void *arg)
 								  task, link);
 						continue;
 					}
+					submit_single_io(task);
+				}
+			}
+
+			/* Open-loop rate limiting: submit parked tasks when the next slot is due */
+			if (g_rate_limit_ns != 0 && !ns_ctx->is_draining &&
+			    !TAILQ_EMPTY(&ns_ctx->free_tasks)) {
+				uint64_t rate_limit_tsc = g_rate_limit_ns * g_tsc_rate / SPDK_SEC_TO_NSEC;
+				uint64_t now_tsc = spdk_get_ticks();
+
+				while (!TAILQ_EMPTY(&ns_ctx->free_tasks) && now_tsc >= ns_ctx->next_submit_tsc) {
+					task = TAILQ_FIRST(&ns_ctx->free_tasks);
+					TAILQ_REMOVE(&ns_ctx->free_tasks, task, link);
+					ns_ctx->next_submit_tsc += rate_limit_tsc;
 					submit_single_io(task);
 				}
 			}
@@ -1901,6 +1955,11 @@ usage(char *program_name)
 	printf("\t-d, --number-ios <val> number of I/O to perform per thread on each namespace. Note: this is additional exit criteria.\n");
 	printf("\t\t(default: 0 - unlimited)\n");
 	printf("\t\tYou may also specify an integer percent of the namespace size as <N>%% (e.g. -d 50%% for 50%% of the namespace size)\n");
+	printf("\t--rate-limit <val>[ns|us|ms] open-loop rate limiting: inter-arrival interval between submissions.\n");
+	printf("\t\tExamples: --rate-limit 100us  (100 µs = 10 kIOPS per thread)\n");
+	printf("\t\t          --rate-limit 10us   (10 µs = 100 kIOPS per thread)\n");
+	printf("\t\t          --rate-limit 1ms    (1 ms = 1 kIOPS per thread)\n");
+	printf("\t\tDefault unit is microseconds. Combine with -d for fixed sample count.\n");
 	printf("\t-e, --metadata <fmt> metadata configuration\n");
 	printf("\t\t Keys:\n");
 	printf("\t\t  PRACT      Protection Information Action bit (PRACT=1 or PRACT=0)\n");
@@ -2437,6 +2496,8 @@ static const struct option g_perf_cmdline_opts[] = {
 	{"dhchap-key", required_argument, NULL, PERF_DHCHAP_PATH},
 #define PERF_DHCHAP_CTRLR_PATH		272
 	{"dhchap-ctrlr-key", required_argument, NULL, PERF_DHCHAP_CTRLR_PATH},
+#define PERF_RATE_LIMIT		273
+	{"rate-limit", required_argument, NULL, PERF_RATE_LIMIT},
 #define PERF_HELP_FULL 'v'
 	{"help-full", no_argument, NULL, PERF_HELP_FULL},
 	/* Should be the last element */
@@ -2726,6 +2787,28 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 				return 1;
 			}
 			break;
+		case PERF_RATE_LIMIT: {
+			/* Accept value with optional suffix: us (microseconds), ms (milliseconds),
+			 * ns (nanoseconds). Plain integer is treated as microseconds.
+			 * Examples: --rate-limit 100us, --rate-limit 1ms, --rate-limit 500ns */
+			char *end;
+			double rate_val = strtod(optarg, &end);
+			if (end == optarg || rate_val < 0) {
+				fprintf(stderr, "Invalid --rate-limit value: %s\n", optarg);
+				return 1;
+			}
+			if (strcmp(end, "ns") == 0) {
+				g_rate_limit_ns = (uint64_t)rate_val;
+			} else if (strcmp(end, "us") == 0 || *end == '\0') {
+				g_rate_limit_ns = (uint64_t)(rate_val * 1000);
+			} else if (strcmp(end, "ms") == 0) {
+				g_rate_limit_ns = (uint64_t)(rate_val * 1000000);
+			} else {
+				fprintf(stderr, "Unknown unit '%s' for --rate-limit. Use ns, us, or ms.\n", end);
+				return 1;
+			}
+			break;
+		}
 		case PERF_DISABLE_ZCOPY:
 			perf_set_sock_opts(optarg, "enable_zerocopy_send_client", 0, NULL);
 			break;
