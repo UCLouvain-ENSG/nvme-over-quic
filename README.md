@@ -110,18 +110,50 @@ sudo ./scripts/tuning_kernel.sh <interface>   # e.g. ens1f0np0 or lo
 ~~~
 
 This sets:
+- Flushes netfilter/iptables rules (eliminates packet filtering overhead)
 - Socket buffer limits (rmem/wmem up to 256 MB)
+- Network backlog and connection queue sizes
 - TCP congestion control to cubic (for fair comparison with QUIC)
 - UDP buffer minimums for high-throughput QUIC
+- Memory overcommit (`vm.overcommit_memory=1`)
+- CPU frequency governor set to `performance`
+- NIC ring buffer sizes increased to 4096
 - NIC offloads: GRO, GSO, TSO, UDP segmentation
 
-### 3. Start the target (controller side)
+### 3. Generate the PSK key (QUIC and TLS only)
+
+QUIC and TLS transports require a shared pre-shared key (PSK) on both the
+controller and host sides. Generate it once; it is reused across runs:
 
 ~~~{.sh}
-sudo ./scripts/controller_run.sh --lcore 0
+./scripts/gen_psk.sh
 ~~~
 
-### 4. Run the host (initiator side)
+This writes `scripts/nvme_psk.key` (NVMe TLS interchange format, mode 600).
+The script re-execs itself under `sudo` automatically, because SPDK's keyring
+module requires the key file to be owned by the same uid as the running process
+(`nvmf_tgt` and `spdk_nvme_perf` both run as root).
+Plain TCP skips this step. `host_run.sh` will also call this automatically
+if the key is missing.
+
+### 4. Start the target (controller side)
+
+~~~{.sh}
+sudo ./scripts/controller_run.sh -m 0x1
+~~~
+
+### 5. Attach the tansport
+
+Bind the NVMe driver to vfio
+~~~{.sh}
+sudo ./setup.sh
+~~~
+
+~~~{.sh}
+sudo ./nvmf_setup.sh -t quic -b /dev/nvme1
+~~~
+
+### 5. Run the host (initiator side)
 
 ~~~{.sh}
 # QUIC transport (default example)

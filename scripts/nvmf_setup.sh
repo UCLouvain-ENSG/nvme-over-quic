@@ -92,21 +92,7 @@ echo ""
 
 # Generate PSK if needed (for tls or quic)
 if [ "$TRANSPORT" = "tls" ] || [ "$TRANSPORT" = "quic" ]; then
-    if [ ! -f "$PSK_FILE" ]; then
-        echo "Generating PSK key..."
-        KEY_HEX=$(xxd -p -c32 -l 32 /dev/urandom)
-        python3 - > "$PSK_FILE" <<EOF
-import base64, zlib
-
-key_hex = "$KEY_HEX"
-key_bytes = bytes.fromhex(key_hex)
-crc = zlib.crc32(key_bytes).to_bytes(4, byteorder="little")
-b64 = base64.b64encode(key_bytes + crc).decode("utf-8")
-print("NVMeTLSkey-1:01:{}:".format(b64), end="")
-EOF
-        chmod 600 "$PSK_FILE"
-        echo "PSK saved to $PSK_FILE"
-    fi
+    "$SCRIPT_DIR/gen_psk.sh"
     echo "PSK: $(cat $PSK_FILE)"
     echo ""
 fi

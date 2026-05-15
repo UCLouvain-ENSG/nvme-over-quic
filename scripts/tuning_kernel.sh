@@ -52,7 +52,7 @@ echo "[4] UDP tuning"
 
 sysctl -w net.ipv4.udp_rmem_min=65536
 sysctl -w net.ipv4.udp_wmem_min=65536
-# udp_mem: min/pressure/max in pages (4KB each); set to ~1GB pressure, ~2GB max
+# udp_mem: min/pressure/max in pages (4KB each); set to ~1GB min, ~2GB pressure, ~3GB max
 sysctl -w net.ipv4.udp_mem="262144 524288 786432"
 echo
 echo "[5] Memory overcommit"
@@ -60,8 +60,20 @@ echo "[5] Memory overcommit"
 sysctl -w vm.overcommit_memory=1
 
 echo
-echo "[6
-echo "[7] Enable NIC offloads"
+echo
+echo "[6] CPU performance governor"
+
+for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    echo performance > "$cpu" 2>/dev/null || true
+done
+
+echo
+echo "[7] Increase NIC ring buffer sizes"
+
+ethtool -G "$IFACE" rx 4096 tx 4096 2>/dev/null || true
+
+echo
+echo "[8] Enable NIC offloads"
 
 ethtool -K $IFACE gro on || true
 ethtool -K $IFACE gso on || true

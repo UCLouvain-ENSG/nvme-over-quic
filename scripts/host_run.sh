@@ -30,6 +30,13 @@ done
 PSK_PATH="$(cd "$(dirname "$0")" && pwd)/nvme_psk.key"
 MODE_LOWER=$(echo "$MODE" | tr '[:upper:]' '[:lower:]')
 
+if [ "$MODE_LOWER" = "tls" ] || [ "$MODE_LOWER" = "quic" ]; then
+    if [ ! -f "$PSK_PATH" ]; then
+        echo "PSK key not found; generating now (may prompt for sudo)..."
+        "$(dirname "$0")/gen_psk.sh"
+    fi
+fi
+
 case "$MODE_LOWER" in
     quic)
         TRANSPORT_ARGS=(--psk-path "$PSK_PATH"

@@ -1,11 +1,31 @@
 #!/bin/bash
-# Force clean rebuild of quicly library and relink binaries
+# Build (or rebuild) SPDK with QUIC support.
+# Safe to run on a clean checkout as well as for iterative quicly rebuilds.
+
+ROOTDIR="$(readlink -f "$(dirname "$0")")"
+cd "$ROOTDIR"
+
+# Initialize submodules if needed.
+# quicly requires recursive init for its own sub-submodules (picotls, klib, picotest).
+if [ ! -f dpdk/config/meson.build ] || [ ! -f quicly/deps/picotls/CMakeLists.txt ]; then
+	echo "Initializing submodules..."
+	git submodule update --init --recursive
+fi
+
+# Run configure if mk/config.mk does not yet exist.
+if [ ! -f mk/config.mk ]; then
+	echo "Running configure..."
+	./configure
+fi
 
 # Clean quicly to pick up source changes
 echo "Cleaning quicly library..."
-cd quicly && make clean 2>/dev/null
-rm -f CMakeCache.txt
-cd ..
+if [ -f quicly/Makefile ]; then
+	make -C quicly clean 2>/dev/null || true
+fi
+# Remove CMake-generated files so quicly is reconfigured on next build
+rm -f quicly/CMakeCache.txt quicly/Makefile quicly/cmake_install.cmake
+rm -rf quicly/CMakeFiles
 
 # Remove binaries to force relinking with new quicly
 echo "Removing binaries to force relink..."
