@@ -1356,6 +1356,27 @@ spdk_nvmf_host_get_nqn(const struct spdk_nvmf_host *host)
 	return host->nqn;
 }
 
+/* Returns true if listener's TRID matches trid, treating 0.0.0.0/:: as wildcards. */
+static bool
+nvmf_listener_trid_matches(const struct spdk_nvmf_subsystem_listener *listener,
+			    const struct spdk_nvme_transport_id *trid)
+{
+	if (spdk_nvme_transport_id_compare(listener->trid, trid) == 0) {
+		return true;
+	}
+
+	/* A wildcard-address listener (0.0.0.0 / ::) must match connections on
+	 * any specific interface: spdk_sock_getaddr() on an accepted socket
+	 * returns the concrete IP, not the wildcard the server bound to. */
+	return listener->trid->trtype == trid->trtype &&
+	       listener->trid->adrfam == trid->adrfam &&
+	       strcmp(listener->trid->trsvcid, trid->trsvcid) == 0 &&
+	       ((trid->adrfam == SPDK_NVMF_ADRFAM_IPV4 &&
+		 strcmp(listener->trid->traddr, "0.0.0.0") == 0) ||
+		(trid->adrfam == SPDK_NVMF_ADRFAM_IPV6 &&
+		 strcmp(listener->trid->traddr, "::") == 0));
+}
+
 struct spdk_nvmf_subsystem_listener *
 nvmf_subsystem_find_listener(struct spdk_nvmf_subsystem *subsystem,
 			     const struct spdk_nvme_transport_id *trid)
@@ -1367,7 +1388,7 @@ nvmf_subsystem_find_listener(struct spdk_nvmf_subsystem *subsystem,
 			continue;
 		}
 
-		if (spdk_nvme_transport_id_compare(listener->trid, trid) == 0) {
+		if (nvmf_listener_trid_matches(listener, trid)) {
 			return listener;
 		}
 	}
@@ -1652,7 +1673,7 @@ spdk_nvmf_subsystem_listener_allowed(struct spdk_nvmf_subsystem *subsystem,
 			continue;
 		}
 
-		if (spdk_nvme_transport_id_compare(listener->trid, trid) == 0) {
+		if (nvmf_listener_trid_matches(listener, trid)) {
 			return true;
 		}
 	}

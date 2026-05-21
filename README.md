@@ -153,7 +153,7 @@ sudo ./setup.sh
 sudo ./nvmf_setup.sh -t quic -b /dev/nvme1
 ~~~
 
-### 5. Run the host (initiator side)
+### 6. Run the host (initiator side)
 
 ~~~{.sh}
 # QUIC transport (default example)
@@ -178,3 +178,120 @@ Key `host_run.sh` options (extra args are passed to `spdk_nvme_perf`):
 | `-w <pattern>` | Workload: `randread`, `randwrite`, `randrw`, `read`, `write` |
 | `-t <seconds>` | Test duration |
 | `--save <file>` | Save output to a log file |
+
+---
+
+## QEMU / virtio-blk Test Setup
+
+This setup chains SPDK subsystems to expose a remote NVMe as a `virtio-blk` device inside a QEMU guest:
+
+```
+nvmf_tgt ──(NVMf/TCP|TLS|QUIC)──> vhost ──(vhost-user)──> QEMU guest (/dev/vda)
+```
+
+Three transport modes are supported — start with TCP, then graduate to TLS and QUIC.
+
+### Architecture
+
+| Process | Binary | Role |
+|---|---|---|
+| NVMf target | `build/bin/nvmf_tgt` | Serves storage over NVMf |
+| SPDK vhost | `build/bin/vhost` | NVMf initiator + vhost-user provider |
+| QEMU | `qemu-system-x86_64` | VM sees remote NVMe as `/dev/vda` |
+
+### Step-by-step (NVMe/TCP — then swap `-t tcp` for `tls` or `quic`)
+
+**Terminal 1 — NVMf target:**
+
+~~~{.sh}
+# Cores 0 and 1 for the target
+sudo ./scripts/controller_run.sh -m 0x3
+~~~
+
+**Terminal 2 — configure the target (run once the target is listening):**
+
+~~~{.sh}
+# -b m = malloc bdev (RAM, no real NVMe needed)
+sudo ./scripts/nvmf_setup.sh -t tcp -b m
+
+# TLS variant:
+# sudo ./scripts/nvmf_setup.sh -t tls -b m
+
+# QUIC variant:
+# sudo ./scripts/nvmf_setup.sh -t quic -b m
+~~~
+
+**Terminal 3 — SPDK vhost (NVMf initiator + vhost-user provider):**
+
+~~~{.sh}
+# Use a different CPU core from nvmf_tgt
+sudo ./scripts/vhost_run.sh -m 0x4
+~~~
+
+**Terminal 4 — connect vhost to the target:**
+
+~~~{.sh}
+sudo ./scripts/vhost_nvmf_setup.sh -t tcp
+
+# TLS variant:
+# sudo ./scripts/vhost_nvmf_setup.sh -t tls
+
+# QUIC variant:
+# sudo ./scripts/vhost_nvmf_setup.sh -t quic
+~~~
+
+**Terminal 5 — start the QEMU VM:**
+
+~~~{.sh}
+# Requires a Linux cloud image (e.g. Ubuntu Server .qcow2)
+./scripts/qemu_start.sh --image /path/to/ubuntu.qcow2
+
+# Optional: use hugepages for better vhost-user performance
+./scripts/qemu_start.sh --image /path/to/ubuntu.qcow2 --hugepages
+~~~
+
+The remote NVMe device appears in the guest as `/dev/vda`. Run I/O inside the VM:
+
+~~~{.sh}
+sudo fio --ioengine=libaio --direct=1 --bs=4k --rw=randread \
+         --iodepth=32 --filename=/dev/vda --runtime=30 --time_based --name=test
+~~~
+
+### Script reference
+
+| Script | Description |
+|---|---|
+| `scripts/vhost_run.sh` | Start SPDK vhost application |
+| `scripts/vhost_nvmf_setup.sh` | Connect vhost to NVMf target, expose via vhost socket |
+| `scripts/qemu_start.sh` | Launch QEMU VM with virtio-blk backed by vhost |
+
+#### `vhost_run.sh` options
+
+| Option | Description |
+|---|---|
+| `-m <mask>` | CPU mask (e.g. `0x4` for core 2) |
+| `--socket-dir <dir>` | Where to create vhost sockets (default: `/tmp/spdk_vhost`) |
+| `--rpc-sock <path>` | Vhost RPC socket path (default: `/var/tmp/vhost.sock`) |
+| `--gdb` | Wrap in GDB for crash analysis |
+
+#### `vhost_nvmf_setup.sh` options
+
+| Option | Description |
+|---|---|
+| `-t tcp\|tls\|quic` | Transport mode (required) |
+| `-i <ip>` | NVMf target IP (default: `127.0.0.1`) |
+| `-s <port>` | NVMf target port (default: `4420`) |
+| `--rpc-sock <path>` | Vhost RPC socket (must match `vhost_run.sh`) |
+| `--ctrlr <name>` | Vhost controller name / socket filename (default: `vhost.blk.0`) |
+
+#### `qemu_start.sh` options
+
+| Option | Description |
+|---|---|
+| `--image <path>` | OS disk image (qcow2/raw) |
+| `--vhost-socket <path>` | Path to vhost socket (default: `/tmp/spdk_vhost/vhost.blk.0`) |
+| `--memory <MB>` | VM RAM in MB (default: `2048`) |
+| `--cpus <n>` | vCPU count (default: `2`) |
+| `--ssh-port <port>` | Host port → VM SSH (default: `10022`) |
+| `--hugepages` | Use `/dev/hugepages` for shared memory (better perf) |
+| `--iso <path>` | Boot from ISO instead of image |

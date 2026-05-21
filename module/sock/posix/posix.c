@@ -103,7 +103,8 @@ static struct spdk_sock_impl_opts g_posix_impl_opts = {
 	.psk_identity = NULL,
 	.get_key = NULL,
 	.get_key_ctx = NULL,
-	.tls_cipher_suites = NULL
+	.tls_cipher_suites = NULL,
+	.tls_writev_flatten = false
 };
 
 static struct spdk_sock_impl_opts g_ssl_impl_opts = {
@@ -118,7 +119,8 @@ static struct spdk_sock_impl_opts g_ssl_impl_opts = {
 	.tls_version = 0,
 	.enable_ktls = false,
 	.psk_key = NULL,
-	.psk_identity = NULL
+	.psk_identity = NULL,
+	.tls_writev_flatten = false
 };
 
 static struct spdk_sock_map g_map = {
@@ -164,6 +166,7 @@ posix_sock_copy_impl_opts(struct spdk_sock_impl_opts *dest, const struct spdk_so
 	SET_FIELD(get_key);
 	SET_FIELD(get_key_ctx);
 	SET_FIELD(tls_cipher_suites);
+	SET_FIELD(tls_writev_flatten);
 
 #undef SET_FIELD
 #undef FIELD_OK
@@ -879,66 +882,61 @@ SSL_readv(SSL *ssl, const struct iovec *iov, int iovcnt)
 	}
 }
 
-/* Set to 1 to flatten all iovecs into a single buffer before SSL_write
- * (one TLS record per writev call).
- * Set to 0 to call SSL_write once per iovec (original behaviour). */
-#define SSL_WRITEV_FLATTEN 0
-
 static ssize_t
-SSL_writev(SSL *ssl, struct iovec *iov, int iovcnt)
+SSL_writev(SSL *ssl, struct iovec *iov, int iovcnt, bool flatten)
 {
 	int rc = 0;
 	ssize_t total = 0;
 
-#if SSL_WRITEV_FLATTEN
-	/* Flatten all iovecs into a single contiguous buffer, then issue one
-	 * SSL_write call.  This produces a single TLS record and avoids the
-	 * per-iovec SSL_write overhead (record header + MAC per fragment). */
-	size_t flat_len = 0;
-	uint8_t *flat_buf, *p;
-	int i;
+	if (flatten) {
+		/* Flatten all iovecs into a single contiguous buffer, then issue one
+		 * SSL_write call.  This produces a single TLS record and avoids the
+		 * per-iovec SSL_write overhead (record header + MAC per fragment). */
+		size_t flat_len = 0;
+		uint8_t *flat_buf, *p;
+		int i;
 
-	for (i = 0; i < iovcnt; i++) {
-		flat_len += iov[i].iov_len;
-	}
+		for (i = 0; i < iovcnt; i++) {
+			flat_len += iov[i].iov_len;
+		}
 
-	flat_buf = malloc(flat_len);
-	if (!flat_buf) {
-		errno = ENOMEM;
-		return -1;
-	}
+		flat_buf = malloc(flat_len);
+		if (!flat_buf) {
+			errno = ENOMEM;
+			return -1;
+		}
 
-	p = flat_buf;
-	for (i = 0; i < iovcnt; i++) {
-		memcpy(p, iov[i].iov_base, iov[i].iov_len);
-		p += iov[i].iov_len;
-	}
+		p = flat_buf;
+		for (i = 0; i < iovcnt; i++) {
+			memcpy(p, iov[i].iov_base, iov[i].iov_len);
+			p += iov[i].iov_len;
+		}
 
-	rc = SSL_write(ssl, flat_buf, flat_len);
-	free(flat_buf);
-
-	if (rc > 0) {
-		total = rc;
-		errno = 0;
-		return total;
-	}
-#else
-	/* Original: one SSL_write call per iovec. */
-	for (int i = 0; i < iovcnt; i++) {
-		rc = SSL_write(ssl, iov[i].iov_base, iov[i].iov_len);
+		rc = SSL_write(ssl, flat_buf, flat_len);
+		free(flat_buf);
 
 		if (rc > 0) {
-			total += rc;
+			total = rc;
+			errno = 0;
+			return total;
 		}
-		if (rc != (int)iov[i].iov_len) {
-			break;
+	} else {
+		/* Original: one SSL_write call per iovec. */
+		for (int i = 0; i < iovcnt; i++) {
+			rc = SSL_write(ssl, iov[i].iov_base, iov[i].iov_len);
+
+			if (rc > 0) {
+				total += rc;
+			}
+			if (rc != (int)iov[i].iov_len) {
+				break;
+			}
+		}
+		if (total > 0) {
+			errno = 0;
+			return total;
 		}
 	}
-	if (total > 0) {
-		errno = 0;
-		return total;
-	}
-#endif
 
 	switch (SSL_get_error(ssl, rc)) {
 	case SSL_ERROR_ZERO_RETURN:
@@ -1473,7 +1471,7 @@ _sock_flush(struct spdk_sock *sock)
 	msg.msg_iovlen = iovcnt;
 
 	if (psock->ssl) {
-		rc = SSL_writev(psock->ssl, iovs, iovcnt);
+		rc = SSL_writev(psock->ssl, iovs, iovcnt, psock->base.impl_opts.tls_writev_flatten);
 	} else {
 		rc = sendmsg(psock->fd, &msg, flags);
 	}
@@ -1755,7 +1753,7 @@ posix_sock_writev(struct spdk_sock *_sock, struct iovec *iov, int iovcnt)
 	}
 
 	if (sock->ssl) {
-		return SSL_writev(sock->ssl, iov, iovcnt);
+		return SSL_writev(sock->ssl, iov, iovcnt, sock->base.impl_opts.tls_writev_flatten);
 	} else {
 		return writev(sock->fd, iov, iovcnt);
 	}

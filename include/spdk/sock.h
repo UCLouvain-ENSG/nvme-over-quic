@@ -194,6 +194,13 @@ struct spdk_sock_impl_opts {
 	const char *tls_cipher_suites;
 
 	/**
+	 * Flatten all iovecs into a single buffer before SSL_write, producing one TLS record per
+	 * writev call instead of one record per iovec. Reduces TLS record overhead at the cost of
+	 * an extra copy. Used by ssl socket module.
+	 */
+	bool tls_writev_flatten;
+
+	/**
 	 * eBPF program file descriptor for SO_REUSEPORT steering. Used by udp socket module.
 	 * Set to -1 to disable eBPF steering.
 	 */

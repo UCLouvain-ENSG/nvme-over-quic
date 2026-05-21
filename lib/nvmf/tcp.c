@@ -1784,8 +1784,9 @@ nvmf_tcp_qpair_set_recv_state(struct spdk_nvmf_tcp_qpair *tqpair,
 			      enum nvme_tcp_pdu_recv_state state)
 {
 	if (tqpair->recv_state == state) {
-		SPDK_ERRLOG("The recv state of tqpair=%p is same with the state(%d) to be set\n",
-			    tqpair, state);
+		SPDK_DEBUGLOG(nvmf_tcp,
+			      "The recv state of tqpair=%p is same with the state(%d) to be set\n",
+			      tqpair, state);
 		return;
 	}
 

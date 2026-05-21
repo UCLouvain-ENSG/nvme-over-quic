@@ -1,0 +1,864 @@
+%info
+NVMe-oF VM Transport Comparison: TCP vs TLS vs QUIC
+Measures fio IOPS, throughput, and latency on /dev/vda inside a QEMU guest VM.
+
+Architecture:
+  [controller role]  nvmf_tgt  (malloc bdev, no real NVMe hardware)
+       |  NVMe/TCP or TLS or QUIC (loopback or real network)
+  [client role]      SPDK vhost  (NVMf initiator + vhost-user bridge)
+       |  vhost-user socket
+  [client role]      QEMU guest VM  (/dev/vda = virtio-blk)
+       |  fio inside the VM
+
+Single-machine usage (both roles on same host):
+  npf-run --test experiments/nvmeof-vm.npf \
+    --cluster controller=localhost client=localhost
+
+Two-machine usage:
+  npf-run --test experiments/nvmeof-vm.npf \
+    --cluster controller=nvme-host.example.com client=qemu-host.example.com
+
+Prerequisites:
+  - SPDK with QUIC support built at SPDK_PATH (default: repo root)
+  - Ubuntu 22.04 cloud image at /tmp/ubuntu-22.04-cloud.img on the client
+  - qemu-system-x86 and sshpass installed on the client
+  - Hugepages allocated on both machines
+
+NOTE (cluster mode, TLS/QUIC): both machines must share the same PSK file at
+  $PSK_FILE. Copy it from the controller after %init@controller runs, e.g. via NFS
+  or: scp controller:$SPDK_PATH/scripts/nvme_psk.key $SPDK_PATH/scripts/nvme_psk.key
+
+%variables
+// Main comparison axis: NVMf transport protocol
+TRANSPORT={tcp,tls,quic}
+// Benchmark mode: fio (raw block I/O) or db (SQLite OLTP on ext4, more realistic)
+BENCH=fio
+//BENCH={fio,db}
+// I/O parameters
+BS=4k
+//BS={4k,512k}
+rw:BS=[4096*262144]
+QD=128
+//QD={1,4,16,32}
+RW=randread
+rw:RW={randread,randwrite}
+// Timing
+RUNTIME=10
+NUMJOBS=1
+
+QEMU_MEM=2
+QEMU_CORES=2
+
+HOST_CORES=1
+CTRL_CORES=1
+// Extra fio options appended to the fio command inside the VM (empty by default;
+// the longitudinal tag sets this to enable per-interval latency logging)
+// VM access (SSH into the QEMU guest on the client machine)
+VM_SSH_PORT=10022
+VM_SSH_PASS=ubuntu
+VM_SSH_USER=ubuntu
+VM_VHOST_SOCKET=/tmp/spdk_vhost/vhost.blk.0
+// NVMf target port (controller listens on 0.0.0.0:TARGET_PORT)
+TARGET_PORT=4420
+SUBNQN=nqn.2026-04.io.spdk:cnode1
+HOSTNQN=nqn.2026-04.io.spdk:host1
+// Storage backend:
+//   malloc     — 512 MB RAM bdev on the controller (safe default, no hardware needed)
+//   nvme       — real NVMe on the controller via VFIO PCIe passthrough (NVME_PCI_ADDR)
+//                set NVME_BIND=true to have %init@controller call scripts/setup.sh
+//   local_nvme — real NVMe on the CLIENT, attached directly to vhost via PCIe
+//                (CLIENT_NVME_PCI_ADDR); bypasses nvmf_tgt entirely — useful as a
+//                baseline that isolates VM/vhost overhead from transport overhead.
+//                set CLIENT_NVME_BIND=true to bind the device to VFIO in %init@client
+BDEV_BACKEND=malloc
+//BDEV_BACKEND=nvme
+//BDEV_BACKEND=local_nvme
+allbdev:BDEV_BACKEND={malloc,nvme,local_nvme}
+MALLOC_SIZE=512
+NVME_PCI_ADDR=0000:02:00.0
+NVME_BIND=false
+CLIENT_NVME_PCI_ADDR=0000:a6:00.0
+CLIENT_NVME_BIND=false
+// SPDK repo root — resolved relative to this .npf file's directory
+// Override per-role if paths differ: SPDK_PATH_CTRL and SPDK_PATH_CLIENT
+SPDK_PATH=../
+
+// ─────────────────────────────────────────────────────────────────────────────
+// fiber tag — FTTH link emulation variables
+//   Override any of these on the npf-run command line, e.g.
+//     --variables FIBER_BW=100mbit,FIBER_DELAY=5ms
+//   References:
+//     RTT/jitter — RIPE Atlas FTTH percentiles (NL/BE/FR, median ≈ 2–3 ms)
+//     Loss       — CAIDA/RIPE Atlas fiber studies: < 0.01 % on GPON/XGS-PON
+//     BW default — 1 Gbps symmetric (Belgium Proximus/Orange, FR, JP, KR, NL)
+//     Burst      — ≥ BW/HZ_min; 1 MB covers HZ=1000 at 1 Gbps without
+//                  artificial micro-burst drops
+//     TBF latency— max queue wait before drop, keeps bufferbloat ≤ ~2 × RTT
+// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// longitudinal tag — time-series latency experiment (30 s, 100 ms resolution)
+//   Events during the run (relative to fio start):
+//     T/4  — loss injected (LONGI_LOSS) on both sides to simulate link degradation
+//     T/2  — client IP changed (QUIC connection migration; TCP/TLS will break)
+//
+//   MIGRATE_IP: set explicitly if auto-derivation (+1 to last octet) is wrong
+//   for your network (e.g. would collide or exceed /24 broadcast).
+//
+//   Result format: RESULT-T_MMMMM_LAT_us where MMMMM is time in ms (zero-padded).
+//   Plot the full series to see the effect of each event on latency.
+// ─────────────────────────────────────────────────────────────────────────────
+longitudinal:RUNTIME=30
+longitudinal:LONGI_LOSS=0.1%
+longitudinal:MIGRATE_IP=
+
+// ─────────────────────────────────────────────────────────────────────────────
+// tlsflatten tag — enable SSL_writev flatten mode at runtime via RPC.
+//   Flattening coalesces all iovecs into one buffer before SSL_write, producing
+//   a single TLS record per writev instead of one record per iovec.
+//   Only meaningful with TRANSPORT=tls; silently has no effect for tcp/quic.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fiber:FIBER_BW=1gbit
+
+fiber:FIBER_BW={100mbit,1gbit,10gbit,1OOgbit}
+FIBER_DELAY=1.25ms
+FIBER_JITTER=100us
+FIBER_LOSS=0.01%
+search,fiber:FIBER_DELAY={0,1.25ms,2.5ms}
+search,fiber:FIBER_JITTER={0,100us}
+search,fiber:FIBER_LOSS={0.01%,0.001%}
+fiber:FIBER_BW_BURST=1m
+fiber:FIBER_TBF_LATENCY=10ms
+
+%config
+timeout=300
+n_runs=3
+var_names={TRANSPORT:NVMf Transport,BENCH:Benchmark,BS:Block Size,QD:Queue Depth (iodepth),RW:Workload,IOPS:IOPS,BW_MiB:Throughput (MiB/s),LAT_us:Latency (µs),NUMJOBS:Number of jobs}
+var_unit={BW_MiB:MiB/s,LAT_us:µs}
+var_log={QD}
+var_lim={0-}
+//graph_subplot_results={IOPS:1,BW_MiB:2}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// %init — one-time setup per role.
+//   @controller: clean up any leftover state.
+//   @client: prepare the VM disk and start QEMU once with reconnect=5 so the
+//            guest persists across SPDK restarts between test combinations.
+// ─────────────────────────────────────────────────────────────────────────────
+
+%init@controller sudo=true
+IFACE="${self:0:ifname}"
+tc qdisc del dev "$IFACE" root 2>/dev/null || true
+SPDK=$SPDK_PATH
+pkill -9 nvmf_tgt 2>/dev/null || true
+sleep 1
+rm -f /var/tmp/spdk.sock
+
+// For real NVMe passthrough, optionally bind the device to VFIO now.
+// This only needs to happen once; set NVME_BIND=true if it isn't already bound.
+if [ "$BDEV_BACKEND" = "nvme" ] && [ "$NVME_BIND" = "true" ]; then
+    echo "Binding NVMe $NVME_PCI_ADDR to VFIO via SPDK setup.sh..."
+    "${SPDK}/scripts/setup.sh"
+fi
+echo "Controller init done"
+
+%init@client sudo=true critical=true
+IFACE="${self:0:ifname}"
+tc qdisc del dev "$IFACE" root 2>/dev/null || true
+echo "Running client init!"
+SPDK=$SPDK_PATH
+VHOST_RPC="${SPDK}/scripts/rpc.py -s /var/tmp/vhost.sock"
+
+// For local NVMe mode, optionally bind the client-side device to VFIO now.
+if [ "$BDEV_BACKEND" = "local_nvme" ] && [ "$CLIENT_NVME_BIND" = "true" ]; then
+    echo "Binding client NVMe $CLIENT_NVME_PCI_ADDR to VFIO via SPDK setup.sh..."
+    "${SPDK}/scripts/setup.sh"
+fi
+
+echo "Killing trailing processes..."
+sleep 1
+
+pkill -9 qemu-system-x86_64 2>/dev/null || true
+pkill -9 vhost 2>/dev/null || true
+sleep 2
+rm -f /var/tmp/vhost.sock
+mkdir -p /tmp/spdk_vhost
+
+echo "Downloading image if needed..."
+// Verify Ubuntu cloud image is present
+if [ ! -f /tmp/ubuntu-22.04-cloud.img ]; then
+    echo "ERROR: /tmp/ubuntu-22.04-cloud.img not found on client." >&2
+    echo "Download with:" >&2
+    echo "  wget https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img \\" >&2
+    echo "       -O /tmp/ubuntu-22.04-cloud.img" >&2
+    exit 1
+fi
+
+// Create a thin qcow2 overlay — base image is never modified
+if [ ! -f /tmp/ubuntu-vm-npf.qcow2 ]; then
+    qemu-img create -f qcow2 -F qcow2 -b /tmp/ubuntu-22.04-cloud.img /tmp/ubuntu-vm-npf.qcow2 5G
+fi
+
+
+echo "Creating image..."
+// Create cloud-init seed ISO (sets password on first boot)
+if [ ! -f /tmp/cloud-init-npf.iso ]; then
+    mkdir -p /tmp/cloud-init-npf
+    printf '#cloud-config\npassword: ubuntu\nchpasswd: { expire: False }\nssh_pwauth: True\n' \
+        > /tmp/cloud-init-npf/user-data
+    printf 'instance-id: nvmeof-npf\nlocal-hostname: nvme-test\n' \
+        > /tmp/cloud-init-npf/meta-data
+    genisoimage -quiet -output /tmp/cloud-init-npf.iso -volid cidata -joliet -rock \
+        /tmp/cloud-init-npf/user-data /tmp/cloud-init-npf/meta-data
+fi
+
+echo "Creating bdev..."
+// Bootstrap vhost with a local malloc bdev.
+// QEMU's vhost-user-blk-pci device must make its initial connection at startup;
+// reconnect=5 only handles re-connection after a drop, not the first attempt.
+// We start a temporary vhost so the socket exists when QEMU boots, then kill it
+// once the VM is up. %script@client restarts vhost connected to the real nvmf_tgt
+// and QEMU hot-swaps via reconnect=5.
+"${SPDK}/build/bin/vhost" --wait-for-rpc --no-pci \
+    -m 0x4 -r /var/tmp/vhost.sock -S /tmp/spdk_vhost 2>&1 | tee /tmp/vhost-init.log &
+VHOST_INIT_PID=$!
+until [ -S /var/tmp/vhost.sock ]; do
+    if ! kill -0 $VHOST_INIT_PID 2>/dev/null; then echo "vhost failed to start"; exit 1; fi
+    sleep 0.2
+done
+${VHOST_RPC} sock_set_default_impl -i posix
+${VHOST_RPC} framework_start_init
+echo "Creating malloc boot bdev"
+${VHOST_RPC} bdev_malloc_create 512 4096 -b malloc_boot
+${VHOST_RPC} vhost_create_blk_controller vhost.blk.0 malloc_boot
+echo "Bootstrap vhost ready"
+killall -9 qemu-system-x86_64 
+sleep 2
+echo "Starting QEMU..."
+// Start QEMU — vhost socket now exists so device initialization succeeds.
+// reconnect=5 will handle the vhost restarts between test combinations.
+qemu-system-x86_64 \
+    -enable-kvm -cpu host -smp sockets=1,cores=${QEMU_CORES},threads=1 -m ${QEMU_MEM}G \
+    -object memory-backend-memfd,id=mem0,size=${QEMU_MEM}G,share=on \
+    -numa node,memdev=mem0 \
+    -drive file=/tmp/ubuntu-vm-npf.qcow2,if=virtio,format=qcow2 \
+    -drive file=/tmp/cloud-init-npf.iso,if=virtio,format=raw,readonly=on \
+    -chardev socket,id=vhost_blk,path=$VM_VHOST_SOCKET,reconnect=5 \
+    -device vhost-user-blk-pci,chardev=vhost_blk,num-queues=${QEMU_CORES} \
+    -netdev user,id=net0,hostfwd=tcp::${VM_SSH_PORT}-:22 \
+    -device virtio-net-pci,netdev=net0 \
+    -serial file:/tmp/qemu-npf-serial.log \
+    -display none -daemonize
+
+// Wait for SSH (cloud-init first boot takes ~60 s)
+echo "Waiting for VM SSH on port $VM_SSH_PORT..."
+for i in $(seq 120); do
+    nc -z -w2 127.0.0.1 $VM_SSH_PORT 2>/dev/null && echo "SSH ready after ${i}s" && break
+    sleep 1
+done
+nc -z -w2 127.0.0.1 $VM_SSH_PORT 2>/dev/null || { echo "ERROR: VM SSH not available after 120s"; exit 1; }
+
+echo "Checking FIO..."
+// Ensure fio is installed in the VM
+sshpass -p $VM_SSH_PASS ssh \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -p $VM_SSH_PORT $VM_SSH_USER@127.0.0.1 \
+    "which fio >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y fio)" 2>/dev/null
+
+// Stop the bootstrap vhost — QEMU will keep retrying reconnect=5 until
+// %script@client starts the real vhost for the first test combination.
+pkill -9 vhost 2>/dev/null; sleep 1
+rm -f /var/tmp/vhost.sock
+echo "Client init done — VM booted, fio installed, bootstrap vhost stopped"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// %script@controller — start and configure nvmf_tgt for the current TRANSPORT.
+//   Prints EVENT CONTROLLER_READY when the target is accepting connections, then
+//   blocks on wait until NPF autokills this script after the client finishes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// fiber tag — per-combination TC setup (runs before the main scripts so rules
+//   are in place before nvmf_tgt + fio start).  Runs on every combination so
+//   FIBER_* variables can be swept across runs.
+//
+//   Chain: tbf (rate limiting) → netem (delay / jitter / loss)
+//   To emulate a different link (e.g. DSL): override FIBER_BW, FIBER_DELAY, etc.
+// ─────────────────────────────────────────────────────────────────────────────
+
+%fiber:script@controller sudo=true autokill=false
+REMOTE_IP="${controller:0:ip}"
+IFACE="${controller:0:ifname}"
+[ -z "$IFACE" ] && exit 1
+echo "[fiber/controller] shaping $IFACE → $REMOTE_IP  rate=$FIBER_BW  delay=${FIBER_DELAY}±$FIBER_JITTER  loss=$FIBER_LOSS"
+tc qdisc del dev "$IFACE" root 2>/dev/null || true
+tc qdisc add dev "$IFACE" root handle 1: tbf rate $FIBER_BW burst $FIBER_BW_BURST latency $FIBER_TBF_LATENCY
+tc qdisc add dev "$IFACE" parent 1:1 handle 10: netem delay $FIBER_DELAY $FIBER_JITTER distribution normal loss $FIBER_LOSS limit 100000
+
+%fiber:script@client sudo=true autokill=false
+REMOTE_IP="${client:0:ip}"
+IFACE="${client:0:ifname}"
+[ -z "$IFACE" ] && exit 1
+echo "[fiber/client] shaping $IFACE → $REMOTE_IP  rate=$FIBER_BW  delay=${FIBER_DELAY}±$FIBER_JITTER  loss=$FIBER_LOSS"
+tc qdisc del dev "$IFACE" root 2>/dev/null || true
+tc qdisc add dev "$IFACE" root handle 1: tbf rate $FIBER_BW burst $FIBER_BW_BURST latency $FIBER_TBF_LATENCY
+tc qdisc add dev "$IFACE" parent 1:1 handle 10: netem delay $FIBER_DELAY $FIBER_JITTER distribution normal loss $FIBER_LOSS limit 100000
+
+%script@controller jinja sudo=true 
+SPDK=$SPDK_PATH
+RPC="${SPDK}/scripts/rpc.py"
+PSK_FILE="$(realpath "${SPDK}/scripts/nvme_psk.key")"
+PSK_NAME="nvme_psk"
+
+
+echo "Launching controller..."
+
+// local_nvme: no target needed — NVMe is attached directly to vhost on the client.
+if [ "$BDEV_BACKEND" = "local_nvme" ]; then
+    echo "EVENT CONTROLLER_READY"
+    echo "local_nvme mode: no nvmf_tgt needed on controller"
+    sleep 100
+    exit 0
+fi
+
+// Tear down any previous run
+pkill -9 nvmf_tgt 2>/dev/null; sleep 1
+rm -f /var/tmp/spdk.sock
+
+// Generate PSK for TLS / QUIC
+if [ "$TRANSPORT" = "tls" ] || [ "$TRANSPORT" = "quic" ]; then
+    "${SPDK}/scripts/gen_psk.sh"
+fi
+
+ethtool -L ${self:0:ifname} combined $CTRL_CORES
+sudo set_irq_affinity_cpulist.sh 0-{{CTRL_CORES - 1}} ${self:0:ifname}
+
+// Start nvmf_tgt and wait for its RPC socket
+CTRL_CORES_MASK=$(printf '0x%x' $(( (1 << $CTRL_CORES) - 1 )))
+echo "Controller using $CTRL_CORES -> mask $CTRL_CORES_MASK"
+"${SPDK}/build/bin/nvmf_tgt" --wait-for-rpc -m $CTRL_CORES_MASK 2>&1 | tee /tmp/nvmf-npf.log &
+NVMF_PID=$!
+until [ -S /var/tmp/spdk.sock ]; do sleep 0.2; done
+
+// Set socket implementation (must be before framework_start_init)
+if   [ "$TRANSPORT" = "quic" ]; then 
+    ${RPC} sock_set_default_impl -i udp
+elif [ "$TRANSPORT" = "tls"  ]; then 
+    ${RPC} sock_set_default_impl -i ssl
+else                                  
+    ${RPC} sock_set_default_impl -i posix
+fi
+${RPC} framework_start_init
+
+// Create NVMf transport
+if [ "$TRANSPORT" = "quic" ]; then
+    ${RPC} nvmf_create_transport -t QUIC
+else
+    ${RPC} nvmf_create_transport -t TCP
+fi
+
+// Create the storage backend bdev
+if [ "$BDEV_BACKEND" = "nvme" ]; then
+    // Attach real NVMe via PCIe — device must already be bound to VFIO
+    // (set NVME_BIND=true in %variables or run scripts/setup.sh manually)
+    echo "Attaching NVMe PCIe device $NVME_PCI_ADDR..."
+    ${RPC} bdev_nvme_attach_controller -b Nvme0 -t PCIe -a "$NVME_PCI_ADDR"
+    NS_BDEV="Nvme0n1"
+else
+    // Pure RAM bdev — no real NVMe hardware involved
+    ${RPC} bdev_malloc_create $MALLOC_SIZE 4096 -b malloc0
+    NS_BDEV="malloc0"
+fi
+${RPC} nvmf_create_subsystem "$SUBNQN" -s SPDK00000000000001 -m 10
+${RPC} nvmf_subsystem_add_ns "$SUBNQN" "${NS_BDEV}" -n 1
+
+// Listen on all interfaces so clients on other machines can connect
+if   [ "$TRANSPORT" = "quic" ]; then 
+    ${RPC} nvmf_subsystem_add_listener "$SUBNQN" -t QUIC -a 0.0.0.0 -s $TARGET_PORT
+elif [ "$TRANSPORT" = "tls"  ]; then 
+    ${RPC} nvmf_subsystem_add_listener "$SUBNQN" -t TCP  -a 0.0.0.0 -s $TARGET_PORT -k
+else                                  
+    ${RPC} nvmf_subsystem_add_listener "$SUBNQN" -t TCP  -a 0.0.0.0 -s $TARGET_PORT
+fi
+
+// Host authentication — for TLS/QUIC load the PSK and bind it to the host NQN;
+// for plain TCP allow any host (no credentials needed).
+if [ "$TRANSPORT" = "tls" ] || [ "$TRANSPORT" = "quic" ]; then
+    ${RPC} keyring_file_add_key "$PSK_NAME" "$PSK_FILE"
+    ${RPC} nvmf_subsystem_add_host "$SUBNQN" "$HOSTNQN" --psk "$PSK_NAME"
+else
+    ${RPC} nvmf_subsystem_allow_any_host "$SUBNQN" --allow-any-host
+fi
+
+echo "EVENT CONTROLLER_READY"
+echo "nvmf_tgt ready: $TRANSPORT on 0.0.0.0:$TARGET_PORT"
+
+// Keep alive until NPF autokills this script when the client combination finishes
+wait $NVMF_PID
+
+// ─────────────────────────────────────────────────────────────────────────────
+// %script@client — start vhost, connect it to the controller, wait for QEMU
+//   to reconnect /dev/vda, run fio inside the VM, emit RESULT lines.
+//   Runs after the controller signals CONTROLLER_READY.
+// ─────────────────────────────────────────────────────────────────────────────
+
+%script@client jinja sudo=true waitfor=CONTROLLER_READY 
+SPDK=$SPDK_PATH
+RPC="${SPDK}/scripts/rpc.py"
+VHOST_RPC="${RPC} -s /var/tmp/vhost.sock"
+PSK_FILE="$(realpath "${SPDK}/scripts/nvme_psk.key")"
+PSK_NAME="nvme_psk"
+
+// ${controller:0:ip} is substituted by NPF with the controller's actual IP.
+// For single-machine runs (--cluster controller=localhost client=localhost)
+// this resolves to 127.0.0.1.
+CTRL_IP="${controller:0:ip}"
+
+// Tear down previous vhost run
+pkill -9 vhost 2>/dev/null; sleep 1
+rm -f /var/tmp/vhost.sock
+mkdir -p /tmp/spdk_vhost
+
+// For TLS/QUIC, the client needs the same PSK as the controller.
+// Single-machine: same filesystem, nothing to do.
+// Cluster mode: sync the PSK from the controller.
+//if [ "$TRANSPORT" = "tls" ] || [ "$TRANSPORT" = "quic" ]; then
+//    if [ "$CTRL_IP" != "127.0.0.1" ] && [ "$CTRL_IP" != "localhost" ]; then
+//        echo "Syncing PSK from controller ($CTRL_IP)..."
+//        scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+//            root@${CTRL_IP}:"${PSK_FILE}" "${PSK_FILE}" \
+//            || { echo "ERROR: could not sync PSK from $CTRL_IP — pre-copy manually"; exit 1; }
+//    fi
+//fi
+
+ethtool -L ${self:0:ifname} combined $HOST_CORES
+sudo set_irq_affinity_cpulist.sh 0-{{HOST_CORES - 1}} ${self:0:ifname}
+
+// Start nvmf_tgt and wait for its RPC socket
+HOST_CORES_MASK=$(printf '0x%x' $(( (1 << $HOST_CORES) - 1 )))
+echo "Controller using $HOST_CORES -> mask $HOST_CORES_MASK"
+
+echo "Starting vhost..."
+// local_nvme needs PCIe access; all other modes use --no-pci (NVMf over network)
+if [ "$BDEV_BACKEND" = "local_nvme" ]; then
+    VHOST_PCI_FLAG=""
+else
+    VHOST_PCI_FLAG="--no-pci"
+fi
+"${SPDK}/build/bin/vhost" --wait-for-rpc $VHOST_PCI_FLAG \
+    -m $HOST_CORES_MASK -r /var/tmp/vhost.sock -S /tmp/spdk_vhost 2>&1 | sudo tee /tmp/vhost-npf.log &
+echo "Waiting for socket to be up..."
+until [ -S /var/tmp/vhost.sock ]; do sleep 0.2; done
+
+if [ "$BDEV_BACKEND" = "local_nvme" ]; then
+    // Local PCIe path: skip NVMf socket setup; posix is fine for management traffic
+    ${VHOST_RPC} sock_set_default_impl -i posix
+    ${VHOST_RPC} framework_start_init
+
+    echo "Attaching local NVMe PCIe device $CLIENT_NVME_PCI_ADDR to vhost..."
+    ${VHOST_RPC} bdev_nvme_attach_controller \
+        -b NvmeLocal -t PCIe -a "$CLIENT_NVME_PCI_ADDR" \
+    || { echo "ERROR: bdev_nvme_attach_controller (PCIe) failed"; exit 1; }
+    BDEV="NvmeLocaln1"
+else
+    // Set socket implementation for vhost's outbound NVMf connection
+    if   [ "$TRANSPORT" = "quic" ]; then
+        ${VHOST_RPC} sock_set_default_impl -i udp
+    elif [ "$TRANSPORT" = "tls"  ]; then
+        ${VHOST_RPC} sock_set_default_impl -i ssl
+    else
+        ${VHOST_RPC} sock_set_default_impl -i posix
+    fi
+    ${VHOST_RPC} framework_start_init
+
+    // Load PSK into vhost keyring for TLS / QUIC
+    if [ "$TRANSPORT" = "tls" ] || [ "$TRANSPORT" = "quic" ]; then
+        ${VHOST_RPC} keyring_file_add_key "${PSK_NAME}" "${PSK_FILE}"
+    fi
+
+    // Validate controller IP — fallback to loopback if ${controller:0:ip} didn't resolve
+    [ -z "${CTRL_IP}" ] && CTRL_IP="127.0.0.1"
+    echo "Connecting to nvmf_tgt at ${CTRL_IP}:$TARGET_PORT (transport=$TRANSPORT)..."
+
+    // Connect vhost to the nvmf_tgt on the controller
+    if [ "$TRANSPORT" = "quic" ]; then
+        ${VHOST_RPC} bdev_nvme_attach_controller \
+            -b NvmeRemote -t QUIC -f IPv4 \
+            -a "${CTRL_IP}" -s $TARGET_PORT \
+            -n "$SUBNQN" -q "$HOSTNQN" -k "${PSK_NAME}" \
+        || { echo "ERROR: bdev_nvme_attach_controller (QUIC) failed"; exit 1; }
+    elif [ "$TRANSPORT" = "tls" ]; then
+        ${VHOST_RPC} bdev_nvme_attach_controller \
+            -b NvmeRemote -t TCP -f IPv4 \
+            -a "${CTRL_IP}" -s $TARGET_PORT \
+            -n "$SUBNQN" -q "$HOSTNQN" -k "${PSK_NAME}" \
+        || { echo "ERROR: bdev_nvme_attach_controller (TLS) failed"; exit 1; }
+    else
+        ${VHOST_RPC} bdev_nvme_attach_controller \
+            -b NvmeRemote -t TCP -f IPv4 \
+            -a "${CTRL_IP}" -s $TARGET_PORT \
+            -n "$SUBNQN" -q "$HOSTNQN" \
+        || { echo "ERROR: bdev_nvme_attach_controller (TCP) failed"; exit 1; }
+    fi
+fi
+
+echo "Creating blk controller..."
+// For local_nvme, BDEV was already set above; for remote modes, auto-detect from vhost.
+// SPDK RPC output is compact JSON; use Python for reliable extraction.
+if [ "$BDEV_BACKEND" != "local_nvme" ]; then
+    ${VHOST_RPC} bdev_get_bdevs
+    BDEV=$(${VHOST_RPC} bdev_get_bdevs 2>/dev/null | tee /tmp/bdev_get_bdevs.log | python3 -c "
+import sys, json
+try:
+    bdevs = json.load(sys.stdin)
+    match = [b['name'] for b in bdevs]
+    print(match[0] if match else '')
+except Exception as e:
+    import sys; print(e, file=sys.stderr)
+" 2>/tmp/bdev-detect.log)
+    if [ -z "${BDEV}" ]; then
+        echo "bdev auto-detect failed ($(cat /tmp/bdev-detect.log)), trying NvmeRemoten1"
+        BDEV="NvmeRemoten1"
+    fi
+fi
+echo "Using bdev: ${BDEV}"
+${VHOST_RPC} vhost_create_blk_controller vhost.blk.0 "${BDEV}"
+if [ $? -ne 0 ] ; then
+    echo "Could not create block!"
+    exit 1
+fi
+
+echo "Waiting for QEMU to reconnect..."
+// Wait for QEMU to reconnect to the new vhost socket and /dev/vda to appear
+// (QEMU polls reconnect=5 every 5 s; give it a full cycle plus margin)
+sleep 10
+
+// Verify /dev/vda is accessible in the VM
+sshpass -p $VM_SSH_PASS ssh \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -p $VM_SSH_PORT $VM_SSH_USER@127.0.0.1 \
+    "ls /dev/vda" 2>/dev/null || { echo "ERROR: /dev/vda not available in VM"; exit 1; }
+
+{% if BENCH == 'db' %}
+// ── db benchmark mode ────────────────────────────────────────────────────────
+// Format /dev/vda as ext4, mount it, run a SQLite OLTP workload (80% reads,
+// 20% balance-transfer writes with FULL sync + WAL), report TPS as RESULT-IOPS.
+// BS/RW/QD are not meaningful here; RUNTIME and TRANSPORT still apply.
+
+sshpass -p $VM_SSH_PASS ssh \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -p $VM_SSH_PORT $VM_SSH_USER@127.0.0.1 \
+    "sudo mkfs.ext4 -F /dev/vda && sudo mkdir -p /mnt/nvme-test && sudo mount /dev/vda /mnt/nvme-test && sudo chmod 777 /mnt/nvme-test" 2>/dev/null \
+    || { echo "ERROR: failed to format/mount /dev/vda for db benchmark"; exit 1; }
+
+// Write the benchmark script to the client machine then push it into the VM.
+// NPF substitutes $RUNTIME before bash runs; everything else is pure Python.
+cat > /tmp/db_bench.py << 'PYSCRIPT'
+import sqlite3, time, random
+
+DB_PATH = '/mnt/nvme-test/bench.db'
+ROWS = 100000
+RUNTIME = $RUNTIME
+
+conn = sqlite3.connect(DB_PATH)
+conn.execute("PRAGMA synchronous = FULL")
+conn.execute("PRAGMA journal_mode = WAL")
+conn.execute("PRAGMA page_size = 4096")
+conn.execute("PRAGMA cache_size = -8192")
+conn.execute("CREATE TABLE IF NOT EXISTS accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL, name TEXT NOT NULL)")
+
+conn.execute("BEGIN")
+for i in range(ROWS):
+    conn.execute("INSERT OR IGNORE INTO accounts VALUES (?, ?, ?)", (i, random.randint(100, 10000), 'user%d' % i))
+conn.execute("COMMIT")
+
+start = time.time()
+deadline = start + RUNTIME
+txn = 0
+lat_sum = 0.0
+
+while time.time() < deadline:
+    t0 = time.time()
+    if random.random() < 0.8:
+        conn.execute("SELECT balance, name FROM accounts WHERE id = ?", (random.randint(0, ROWS - 1),)).fetchone()
+    else:
+        src = random.randint(0, ROWS - 1)
+        dst = random.randint(0, ROWS - 1)
+        amount = random.randint(1, 100)
+        conn.execute("BEGIN")
+        conn.execute("UPDATE accounts SET balance = balance - ? WHERE id = ?", (amount, src))
+        conn.execute("UPDATE accounts SET balance = balance + ? WHERE id = ?", (amount, dst))
+        conn.execute("COMMIT")
+    lat_sum += (time.time() - t0) * 1000000.0
+    txn += 1
+
+elapsed = time.time() - start
+tps = txn / elapsed
+avg_lat = lat_sum / txn if txn > 0 else 0
+
+print("SQLite OLTP: %d txn in %.1fs = %.0f TPS, avg_lat=%.1f us" % (txn, elapsed, tps, avg_lat))
+print("RESULT-IOPS %d" % int(tps))
+print("RESULT-BW_MiB 0")
+print("RESULT-LAT_us %.2f" % avg_lat)
+PYSCRIPT
+
+sshpass -p $VM_SSH_PASS scp \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -P $VM_SSH_PORT /tmp/db_bench.py $VM_SSH_USER@127.0.0.1:/tmp/db_bench.py
+
+// EVENT FIO_START is used by the longitudinal scripts to sync; emit it here too.
+echo "EVENT FIO_START"
+sshpass -p $VM_SSH_PASS ssh \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -p $VM_SSH_PORT $VM_SSH_USER@127.0.0.1 \
+    "sudo python3 /tmp/db_bench.py" 2>/dev/null | tee /tmp/db-npf-result.txt
+
+sshpass -p $VM_SSH_PASS ssh \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -p $VM_SSH_PORT $VM_SSH_USER@127.0.0.1 \
+    "sudo umount /mnt/nvme-test" 2>/dev/null || true
+
+{% else %}
+// ── fio benchmark mode (default) ─────────────────────────────────────────────
+FIO_EXTRA_OPTS=
+{% if longitudinal %}
+FIO_EXTRA_OPTS="--write_lat_log=/tmp/fio_longi_lat --log_avg_msec=100"
+{% endif %}
+// Run fio inside the VM, capture its output.
+// EVENT FIO_START lets longitudinal event-injection scripts sync to fio's actual start.
+echo "EVENT FIO_START"
+sshpass -p $VM_SSH_PASS ssh \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -p $VM_SSH_PORT $VM_SSH_USER@127.0.0.1 \
+    "sudo fio --ioengine=libaio --direct=1 \
+     --bs=$BS --rw=$RW --iodepth=$QD --numjobs=$NUMJOBS \
+     --filename=/dev/vda --runtime=$RUNTIME --time_based \
+     --name=nvmf-$TRANSPORT-bs$BS-qd$QD --group_reporting \
+     $FIO_EXTRA_OPTS \
+     2>&1" 2>/dev/null | tee /tmp/fio-npf-result.txt
+
+
+// Parse fio output and emit RESULT lines.
+// NPF substitutes $RW before the script runs, so the Python sees a literal string.
+python3 - << 'PYEOF'
+import sys, re
+
+with open('/tmp/fio-npf-result.txt') as f:
+    text = f.read()
+
+rw = '$RW'
+section = 'read' if rw in ('randread', 'read') else 'write'
+
+# IOPS: "  read: IOPS=339k, BW=..."
+m = re.search(r'\s+' + section + r':.*?IOPS=([0-9.]+)([kKMGmg]?)', text)
+if m:
+    mult = {'k':1e3,'K':1e3,'m':1e6,'M':1e6,'g':1e9,'G':1e9}.get(m.group(2), 1.0)
+    print('RESULT-IOPS', int(float(m.group(1)) * mult))
+else:
+    print('RESULT-IOPS 0')
+
+# Bandwidth: normalise to MiB/s
+m = re.search(r'\s+' + section + r':.*?BW=([0-9.]+)\s*([\w/]+)', text)
+if m:
+    bw, unit = float(m.group(1)), m.group(2)
+    to_mib = {'GiB/s':1024.0,'MiB/s':1.0,'KiB/s':1/1024,
+              'GB/s':953.674,'MB/s':0.953674,'kB/s':0.000953674}
+    print('RESULT-BW_MiB', round(bw * to_mib.get(unit, 1.0), 2))
+else:
+    print('RESULT-BW_MiB 0')
+
+# Completion latency average in µs
+m = re.search(r'clat \(usec\).*?avg=\s*([0-9.]+)', text, re.DOTALL)
+if m:
+    print('RESULT-LAT_us', float(m.group(1)))
+else:
+    m = re.search(r'clat \(msec\).*?avg=\s*([0-9.]+)', text, re.DOTALL)
+    print('RESULT-LAT_us', float(m.group(1)) * 1000 if m else 0)
+PYEOF
+{% endif %}
+
+// Tear down vhost — the controller's nvmf_tgt is killed by NPF autokill on
+// the @controller script when this combination finishes.
+pkill -9 vhost 2>/dev/null; sleep 1
+rm -f /var/tmp/vhost.sock
+
+// ─────────────────────────────────────────────────────────────────────────────
+// %exit — stop all processes after all combinations finish
+// ─────────────────────────────────────────────────────────────────────────────
+
+%exit@client sudo=true
+pkill -9 qemu-system-x86_64 2>/dev/null || true
+pkill -9 vhost 2>/dev/null || true
+sleep 1
+rm -f /var/tmp/vhost.sock
+echo "Client exit done"
+
+%exit@controller sudo=true
+pkill -9 nvmf_tgt 2>/dev/null || true
+sleep 1
+rm -f /var/tmp/spdk.sock
+echo "Controller exit done"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// fiber tag — TC cleanup (runs once after all combinations)
+// ─────────────────────────────────────────────────────────────────────────────
+
+%fiber:exit@controller sudo=true
+IFACE="${self:0:ifname}"
+tc qdisc del dev "$IFACE" root 2>/dev/null || true
+echo "[fiber/controller] TC rules removed from $IFACE"
+
+%fiber:exit@client sudo=true
+IFACE="${self:0:ifname}"
+tc qdisc del dev "$IFACE" root 2>/dev/null || true
+echo "[fiber/client] TC rules removed from $IFACE"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// tlsflatten tag — set tls_writev_flatten=true on nvmf_tgt (controller) and
+//   vhost (client) as soon as their RPC sockets are available.
+//   Must run before the first TLS connection is accepted / initiated.
+// ─────────────────────────────────────────────────────────────────────────────
+
+%tlsflatten:script@controller sudo=true autokill=false
+SPDK=$SPDK_PATH
+RPC="${SPDK}/scripts/rpc.py"
+echo "[tlsflatten/controller] waiting for nvmf_tgt RPC socket..."
+until [ -S /var/tmp/spdk.sock ]; do sleep 0.1; done
+echo "[tlsflatten/controller] enabling tls_writev_flatten on ssl impl"
+${RPC} sock_impl_set_options -i ssl --tls-writev-flatten
+echo "[tlsflatten/controller] done"
+
+%tlsflatten:script@client sudo=true autokill=false
+SPDK=$SPDK_PATH
+RPC="${SPDK}/scripts/rpc.py"
+VHOST_RPC="${RPC} -s /var/tmp/vhost.sock"
+echo "[tlsflatten/client] waiting for vhost RPC socket..."
+until [ -S /var/tmp/vhost.sock ]; do sleep 0.1; done
+echo "[tlsflatten/client] enabling tls_writev_flatten on ssl impl"
+${VHOST_RPC} sock_impl_set_options -i ssl --tls-writev-flatten
+echo "[tlsflatten/client] done"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// longitudinal tag — event injection scripts (run per-combination, start at
+//   FIO_START so timing is anchored to when fio actually begins).
+//
+//   Controller: injects packet loss at T/4.
+//   Client:     changes source IP at T/2 (QUIC connection migration demo),
+//               then retrieves the per-100ms fio latency log and emits
+//               RESULT-T_MMMMM_LAT_us lines for NPF time-series plotting.
+// ─────────────────────────────────────────────────────────────────────────────
+
+%longitudinal:script@controller sudo=true waitfor=FIO_START autokill=false
+IFACE="${self:0:ifname}"
+
+QUARTER=$(($RUNTIME / 4))
+echo "[longitudinal/controller] fio running; injecting loss=$LONGI_LOSS on $IFACE in ${QUARTER}s"
+sleep $QUARTER
+
+// Inject loss.  If fiber is active its netem is at parent 1:1 handle 10: —
+// change it in-place to preserve delay settings.  Otherwise create a new root netem.
+if [ -n "$FIBER_DELAY" ]; then
+    tc qdisc change dev "$IFACE" parent 1:1 handle 10: netem \
+        delay $FIBER_DELAY $FIBER_JITTER distribution normal loss $LONGI_LOSS
+else
+    tc qdisc del dev "$IFACE" root 2>/dev/null || true
+    tc qdisc add dev "$IFACE" root handle 10: netem loss $LONGI_LOSS
+fi
+echo "[longitudinal/controller] t=T/4 loss=$LONGI_LOSS injected on $IFACE"
+
+%longitudinal:script@client sudo=true waitfor=FIO_START  autokill=false
+SPDK=$SPDK_PATH
+IFACE="${self:0:ifname}"
+CURRENT_IP="${self:0:ip}"
+
+MASK=$(ip addr show dev "$IFACE" | awk '/inet / {print $2; exit}' | cut -d/ -f2)
+
+// Also inject loss on the client-side egress (symmetric with controller side)
+QUARTER=$(($RUNTIME / 4))
+sleep $QUARTER
+if [ -n "$FIBER_DELAY" ]; then
+    tc qdisc change dev "$IFACE" parent 1:1 handle 10: netem \
+        delay $FIBER_DELAY $FIBER_JITTER distribution normal loss $LONGI_LOSS
+else
+    tc qdisc del dev "$IFACE" root 2>/dev/null || true
+    tc qdisc add dev "$IFACE" root handle 10: netem loss $LONGI_LOSS
+fi
+echo "[longitudinal/client] t=T/4 loss=$LONGI_LOSS injected on $IFACE"
+
+// At T/2: change source IP to trigger QUIC connection migration.
+// TCP/TLS connections will break here; QUIC should migrate transparently.
+sleep $QUARTER
+
+echo "Migrate IP is $MIGRATE_IP"
+// Auto-derive new IP if MIGRATE_IP is not explicitly set
+MIGRATE_IP_USE="$MIGRATE_IP"
+if [ -z "$MIGRATE_IP_USE" ]; then
+    IFS='.' read -r _a _b _c _d <<< "$CURRENT_IP"
+    _NEW_D=$(( _d == 254 ? _d - 1 : _d + 1 ))
+    MIGRATE_IP_USE="$_a.$_b.$_c.$_NEW_D"
+fi
+echo "Computed migrate IP is $MIGRATE_IP_USE"
+
+ip addr add "${MIGRATE_IP_USE}/${MASK}" dev "$IFACE" 2>/dev/null || true
+ip route add "${CTRL_IP}/32" dev "$IFACE" src "$MIGRATE_IP_USE" metric 1 2>/dev/null || true
+echo "[longitudinal/client] t=T/2 IP migrated: $CURRENT_IP → $MIGRATE_IP_USE on $IFACE"
+
+// Wait for fio to finish (remaining T/2), then retrieve the per-interval lat log
+sleep $(($RUNTIME / 2))
+
+echo "[longitudinal/client] collecting per-interval latency log from VM..."
+sshpass -p $VM_SSH_PASS scp \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -P $VM_SSH_PORT $VM_SSH_USER@127.0.0.1:/tmp/fio_longi_lat_clat.1.log \
+    /tmp/fio_longi_lat_clat.1.log 2>/dev/null || true
+
+// Parse fio clat log and emit time-series RESULT lines.
+// Format: RESULT-T_MMMMM_LAT_us  where MMMMM is zero-padded time in ms.
+// Mark the two event times in the output for easy post-processing.
+python3 - << 'PYEOF'
+import os
+
+RT     = int('$RUNTIME')
+LOSS_T = RT // 4 * 1000  # ms into run when loss is injected (T/4)
+MIG_T  = RT // 2 * 1000  # ms into run when IP migration happens (T/2)
+
+logfile = '/tmp/fio_longi_lat_clat.1.log'
+if not os.path.exists(logfile):
+    print('RESULT-T_00000_LAT_us 0')  # sentinel: log not found
+else:
+    with open(logfile) as f:
+        for line in f:
+            parts = line.strip().split(',')
+            if len(parts) < 2:
+                continue
+            try:
+                t_ms   = int(parts[0].strip())
+                lat_us = float(parts[1].strip()) / 1000.0
+                print(f'T-{t_ms:05d}-RESULT-LAT {lat_us:.1f}')
+            except Exception:
+                pass
+    # Emit event timestamps so post-processing can draw vertical markers
+    print(f'RESULT-EVENT_LOSS_T_ms {LOSS_T}')
+    print(f'RESULT-EVENT_MIGRATE_T_ms {MIG_T}')
+PYEOF
+
+%longitudinal:exit@client sudo=true
+CTRL_IP="${self:0:ip}"
+IFACE="${self:0:ifname}"
+
+// Remove the migration IP alias and host route (best-effort)
+ip route del "${CTRL_IP}/32" metric 1 2>/dev/null || true
+CURRENT_IP=$(ip route get "$CTRL_IP" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
+MASK=$(ip addr show dev "$IFACE" | awk '/inet / {print $2; exit}' | cut -d/ -f2)
+IFS='.' read -r _a _b _c _d <<< "$CURRENT_IP"
+_NEW_D=$(( _d == 254 ? _d - 1 : _d + 1 ))
+ip addr del "$_a.$_b.$_c.$_NEW_D/$MASK" dev "$IFACE" 2>/dev/null || true
+// Remove injected loss TC rules
+tc qdisc del dev "$IFACE" root 2>/dev/null || true
+echo "[longitudinal/client] cleanup done"
+
+%longitudinal:exit@controller sudo=true
+CTRL_IP="${controller:0:ip}"
+IFACE="${controller:0:ifname}"
+tc qdisc del dev "$IFACE" root 2>/dev/null || true
+echo "[longitudinal/controller] cleanup done"

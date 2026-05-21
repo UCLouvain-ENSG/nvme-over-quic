@@ -32,7 +32,8 @@ def add_parser(subparsers):
                                        enable_zerocopy_send_client=args.enable_zerocopy_send_client,
                                        zerocopy_threshold=args.zerocopy_threshold,
                                        tls_version=args.tls_version,
-                                       enable_ktls=args.enable_ktls)
+                                       enable_ktls=args.enable_ktls,
+                                       tls_writev_flatten=args.tls_writev_flatten)
 
     p = subparsers.add_parser('sock_impl_set_options', help="""Set options of socket layer implementation""")
     p.add_argument('-i', '--impl', dest='impl_name', help='Socket implementation name, e.g. posix', required=True)
@@ -81,9 +82,11 @@ def add_parser(subparsers):
                        action=DeprecateFalseAction, dest='enable_ktls')
     group.add_argument('--ktls', dest='enable_ktls', action=argparse.BooleanOptionalAction,
                        help='Enable or disable Kernel TLS')
+    p.add_argument('--tls-writev-flatten', dest='tls_writev_flatten', action=argparse.BooleanOptionalAction,
+                   help='Flatten all iovecs into one buffer before SSL_write (one TLS record per writev)')
     p.set_defaults(func=sock_impl_set_options, enable_recv_pipe=None, enable_quickack=None,
                    enable_placement_id=None, enable_zerocopy_send_server=None, enable_zerocopy_send_client=None,
-                   zerocopy_threshold=None, tls_version=None, enable_ktls=None)
+                   zerocopy_threshold=None, tls_version=None, enable_ktls=None, tls_writev_flatten=None)
 
     def sock_set_default_impl(args):
         print_json(args.client.sock_set_default_impl(impl_name=args.impl_name))
