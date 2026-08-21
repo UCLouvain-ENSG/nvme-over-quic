@@ -31,6 +31,7 @@ NOTE (cluster mode, TLS/QUIC): both machines must share the same PSK file at
 %variables
 // Main comparison axis: NVMf transport protocol
 TRANSPORT={tcp,tls,quic}
+tlsflatten:FLATTEN=1
 // Benchmark mode: fio (raw block I/O) or db (SQLite OLTP on ext4, more realistic)
 BENCH=fio
 //BENCH={fio,db}
@@ -135,8 +136,10 @@ timeout=300
 n_runs=3
 var_names={TRANSPORT:NVMf Transport,BENCH:Benchmark,BS:Block Size,QD:Queue Depth (iodepth),RW:Workload,IOPS:IOPS,BW_MiB:Throughput (MiB/s),LAT_us:Latency (µs),NUMJOBS:Number of jobs}
 var_unit={BW_MiB:MiB/s,LAT_us:µs}
-var_log={QD}
+var_log={QD,BS}
 var_lim={0-}
+rw:var_divider={BS:1024}
+rw:var_format={BS:%dKB}
 //graph_subplot_results={IOPS:1,BW_MiB:2}
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -344,10 +347,16 @@ until [ -S /var/tmp/spdk.sock ]; do sleep 0.2; done
 if   [ "$TRANSPORT" = "quic" ]; then 
     ${RPC} sock_set_default_impl -i udp
 elif [ "$TRANSPORT" = "tls"  ]; then 
+
     ${RPC} sock_set_default_impl -i ssl
 else                                  
     ${RPC} sock_set_default_impl -i posix
 fi
+
+if [ "$FLATTEN" = "1" ] ; then
+    ${RPC} sock_impl_set_options -i ssl --tls-writev-flatten
+fi
+
 ${RPC} framework_start_init
 
 // Create NVMf transport
@@ -469,6 +478,11 @@ else
     else
         ${VHOST_RPC} sock_set_default_impl -i posix
     fi
+
+    if [ "$FLATTEN" = "1" ] ; then
+        ${VHOST_RPC} sock_impl_set_options -i ssl --tls-writev-flatten
+    fi
+
     ${VHOST_RPC} framework_start_init
 
     // Load PSK into vhost keyring for TLS / QUIC
@@ -713,30 +727,7 @@ IFACE="${self:0:ifname}"
 tc qdisc del dev "$IFACE" root 2>/dev/null || true
 echo "[fiber/client] TC rules removed from $IFACE"
 
-// ─────────────────────────────────────────────────────────────────────────────
-// tlsflatten tag — set tls_writev_flatten=true on nvmf_tgt (controller) and
-//   vhost (client) as soon as their RPC sockets are available.
-//   Must run before the first TLS connection is accepted / initiated.
-// ─────────────────────────────────────────────────────────────────────────────
 
-%tlsflatten:script@controller sudo=true autokill=false
-SPDK=$SPDK_PATH
-RPC="${SPDK}/scripts/rpc.py"
-echo "[tlsflatten/controller] waiting for nvmf_tgt RPC socket..."
-until [ -S /var/tmp/spdk.sock ]; do sleep 0.1; done
-echo "[tlsflatten/controller] enabling tls_writev_flatten on ssl impl"
-${RPC} sock_impl_set_options -i ssl --tls-writev-flatten
-echo "[tlsflatten/controller] done"
-
-%tlsflatten:script@client sudo=true autokill=false
-SPDK=$SPDK_PATH
-RPC="${SPDK}/scripts/rpc.py"
-VHOST_RPC="${RPC} -s /var/tmp/vhost.sock"
-echo "[tlsflatten/client] waiting for vhost RPC socket..."
-until [ -S /var/tmp/vhost.sock ]; do sleep 0.1; done
-echo "[tlsflatten/client] enabling tls_writev_flatten on ssl impl"
-${VHOST_RPC} sock_impl_set_options -i ssl --tls-writev-flatten
-echo "[tlsflatten/client] done"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // longitudinal tag — event injection scripts (run per-combination, start at
@@ -862,3 +853,6 @@ CTRL_IP="${controller:0:ip}"
 IFACE="${controller:0:ifname}"
 tc qdisc del dev "$IFACE" root 2>/dev/null || true
 echo "[longitudinal/controller] cleanup done"
+
+
+%perf:import@client perf-class waitfor=FIO_START delay=1
